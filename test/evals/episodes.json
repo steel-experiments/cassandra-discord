@@ -1,0 +1,229 @@
+{
+  "$schema": "./schema.json",
+  "version": "1.0.0",
+  "description": "Synthetic, fully labeled evaluation episodes (Section 46.4). No production content: every conversation is reduced to counts and ids. Each episode carries a mock model response per prompt version so the harness stays deterministic and never calls a live model.",
+  "promptVersions": ["v1.0.0-baseline", "v1.1.0-tuned"],
+  "thresholds": {
+    "interventionConfidence": 0.78,
+    "minEvidenceStrength": 0.65,
+    "minPrecision": 0.8
+  },
+  "episodes": [
+    {
+      "id": "eval-silent",
+      "label": "silent",
+      "visibility": "org",
+      "mode": "observe",
+      "conversationMessageCount": 6,
+      "responses": {
+        "v1.0.0-baseline": { "memories": [], "notification": null, "costUsd": 0.0008, "responseLengthChars": 40 },
+        "v1.1.0-tuned": { "memories": [], "notification": null, "costUsd": 0.0007, "responseLengthChars": 35 }
+      }
+    },
+    {
+      "id": "eval-memory-only",
+      "label": "memory_only",
+      "visibility": "org",
+      "mode": "observe",
+      "conversationMessageCount": 5,
+      "responses": {
+        "v1.0.0-baseline": {
+          "memories": [{ "id": "m1", "text": "decision: ship feature X in sprint 12" }],
+          "notification": null,
+          "costUsd": 0.0012,
+          "responseLengthChars": 120
+        },
+        "v1.1.0-tuned": {
+          "memories": [{ "id": "m1", "text": "decision: ship feature X in sprint 12" }],
+          "notification": null,
+          "costUsd": 0.0011,
+          "responseLengthChars": 110
+        }
+      }
+    },
+    {
+      "id": "eval-review",
+      "label": "review",
+      "visibility": "restricted",
+      "mode": "review",
+      "conversationMessageCount": 8,
+      "responses": {
+        "v1.0.0-baseline": {
+          "memories": [],
+          "notification": {
+            "recommend": true,
+            "confidence": 0.72,
+            "targetVisibility": "review_only",
+            "evidenceRestricted": false,
+            "evidenceStrength": 0.8,
+            "evidenceMessageIds": ["msg-1", "msg-3"],
+            "verdict": "approved"
+          },
+          "costUsd": 0.0021,
+          "responseLengthChars": 240
+        },
+        "v1.1.0-tuned": {
+          "memories": [],
+          "notification": {
+            "recommend": true,
+            "confidence": 0.74,
+            "targetVisibility": "review_only",
+            "evidenceRestricted": false,
+            "evidenceStrength": 0.82,
+            "evidenceMessageIds": ["msg-1", "msg-3"],
+            "verdict": "approved"
+          },
+          "costUsd": 0.002,
+          "responseLengthChars": 220
+        }
+      }
+    },
+    {
+      "id": "eval-autonomous",
+      "label": "autonomous",
+      "visibility": "org",
+      "mode": "autonomous",
+      "conversationMessageCount": 9,
+      "responses": {
+        "v1.0.0-baseline": {
+          "memories": [],
+          "notification": {
+            "recommend": true,
+            "confidence": 0.86,
+            "targetVisibility": "org",
+            "evidenceRestricted": false,
+            "evidenceStrength": 0.9,
+            "evidenceMessageIds": ["msg-2", "msg-5", "msg-7"]
+          },
+          "costUsd": 0.0026,
+          "responseLengthChars": 280
+        },
+        "v1.1.0-tuned": {
+          "memories": [],
+          "notification": {
+            "recommend": true,
+            "confidence": 0.88,
+            "targetVisibility": "org",
+            "evidenceRestricted": false,
+            "evidenceStrength": 0.91,
+            "evidenceMessageIds": ["msg-2", "msg-5", "msg-7"]
+          },
+          "costUsd": 0.0024,
+          "responseLengthChars": 260
+        }
+      }
+    },
+    {
+      "id": "eval-lifecycle",
+      "label": "lifecycle_update",
+      "visibility": "org",
+      "mode": "observe",
+      "conversationMessageCount": 4,
+      "responses": {
+        "v1.0.0-baseline": {
+          "memories": [{ "id": "m2", "text": "decision: ship feature X in sprint 13 (supersedes sprint 12)", "supersededId": "m1" }],
+          "notification": null,
+          "costUsd": 0.0014,
+          "responseLengthChars": 150
+        },
+        "v1.1.0-tuned": {
+          "memories": [{ "id": "m2", "text": "decision: ship feature X in sprint 13 (supersedes sprint 12)", "supersededId": "m1" }],
+          "notification": null,
+          "costUsd": 0.0013,
+          "responseLengthChars": 140
+        }
+      }
+    },
+    {
+      "id": "eval-refusal",
+      "label": "visibility_refusal",
+      "visibility": "restricted",
+      "mode": "autonomous",
+      "conversationMessageCount": 7,
+      "responses": {
+        "v1.0.0-baseline": {
+          "memories": [],
+          "notification": {
+            "recommend": true,
+            "confidence": 0.9,
+            "targetVisibility": "org",
+            "evidenceRestricted": true,
+            "evidenceStrength": 0.7,
+            "evidenceMessageIds": ["rmsg-1"]
+          },
+          "costUsd": 0.0023,
+          "responseLengthChars": 250
+        },
+        "v1.1.0-tuned": {
+          "memories": [],
+          "notification": null,
+          "costUsd": 0.0009,
+          "responseLengthChars": 45
+        }
+      }
+    },
+    {
+      "id": "eval-duplicate",
+      "label": "memory_only",
+      "visibility": "org",
+      "mode": "observe",
+      "conversationMessageCount": 5,
+      "duplicateMemory": true,
+      "responses": {
+        "v1.0.0-baseline": {
+          "memories": [{ "id": "m1", "text": "decision: ship feature X in sprint 12" }],
+          "notification": null,
+          "duplicate": true,
+          "costUsd": 0.0012,
+          "responseLengthChars": 120
+        },
+        "v1.1.0-tuned": {
+          "memories": [{ "id": "m3", "text": "decision: ship feature X in sprint 12 (refined)" }],
+          "notification": null,
+          "duplicate": false,
+          "costUsd": 0.0011,
+          "responseLengthChars": 115
+        }
+      }
+    },
+    {
+      "id": "eval-dismissed",
+      "label": "review",
+      "visibility": "restricted",
+      "mode": "review",
+      "conversationMessageCount": 6,
+      "responses": {
+        "v1.0.0-baseline": {
+          "memories": [],
+          "notification": {
+            "recommend": true,
+            "confidence": 0.68,
+            "targetVisibility": "review_only",
+            "evidenceRestricted": false,
+            "evidenceStrength": 0.5,
+            "evidenceMessageIds": ["msg-1"],
+            "verdict": "dismissed",
+            "dismissalReason": "weak evidence"
+          },
+          "costUsd": 0.0018,
+          "responseLengthChars": 200
+        },
+        "v1.1.0-tuned": {
+          "memories": [],
+          "notification": {
+            "recommend": true,
+            "confidence": 0.69,
+            "targetVisibility": "review_only",
+            "evidenceRestricted": false,
+            "evidenceStrength": 0.55,
+            "evidenceMessageIds": ["msg-1"],
+            "verdict": "dismissed",
+            "dismissalReason": "weak evidence"
+          },
+          "costUsd": 0.0017,
+          "responseLengthChars": 190
+        }
+      }
+    }
+  ]
+}

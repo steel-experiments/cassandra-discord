@@ -1,0 +1,56 @@
+# Cassandra deployment (Section 39).
+#
+# All application settings flow from a ./.env file through env_file. The
+# application validates every setting itself and stops with a precise message
+# when one is missing or wrong, so this file adds no required-variable guards.
+# The environment block below holds only the values fixed by the container
+# layout; it must stay limited to that override set. PORT comes from .env
+# (application default 3000) while expose stays 3000 — set both together when
+# you change the port.
+services:
+  cassandra:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    restart: unless-stopped
+
+    env_file:
+      - path: .env
+        required: false
+
+    environment:
+      NODE_ENV: production
+      HOME: /tmp
+      DATA_DIR: /app/data
+      DATABASE_PATH: /app/data/cassandra.sqlite
+      PROMPT_DIR: /app/prompts
+      DOCS_DIR: /app/docs
+      CASSANDRA_CONFIG_PATH: /app/config/cassandra.yml
+      CHANNEL_POLICY_PATH: /app/config/channel-policy.yml
+
+    volumes:
+      - cassandra_data:/app/data
+
+    expose:
+      - "3000"
+
+    stop_grace_period: 45s
+
+    healthcheck:
+      test: ["CMD", "node", "dist/healthcheck.js"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+    read_only: true
+
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  cassandra_data:

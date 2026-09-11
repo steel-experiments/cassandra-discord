@@ -1,0 +1,75 @@
+site_name: Cassandra for Discord
+site_description: Public documentation for Cassandra, a quiet organizational-memory agent for Discord.
+site_url: https://steel-experiments.github.io/cassandra-discord/
+
+docs_dir: docs
+site_dir: site
+strict: true
+
+nav:
+  - Home: index.md
+  - Quickstart: tutorials/getting-started.md
+  - Deploy:
+      - Docker Compose and the released image: how-to/deploy.md
+      - Railway template: how-to/railway.md
+  - Operations:
+      - Back up and restore: how-to/backup-and-restore.md
+      - Roll out safely: how-to/roll-out-safely.md
+      - Publish the member privacy notice: how-to/publish-privacy-notice.md
+  - Use:
+      - Team member guide: how-to/use-cassandra.md
+      - Connect MCP clients: how-to/connect-mcp-clients.md
+  - Privacy: privacy-notice.md
+  - Security: security.md
+  - Troubleshooting: how-to/troubleshooting.md
+  - Reference:
+      - Configuration: reference/configuration.md
+      - VM requirements: reference/vm-requirements.md
+      - Discord commands: reference/discord-commands.md
+      - HTTP and MCP: reference/http-and-mcp.md
+  - Explanation:
+      - Memory quality: explanation/memory-quality.md
+      - Architecture: explanation/architecture.md
+      - Speaking and review: explanation/speaking-and-review.md
+      - Conversation analysis: explanation/conversation-analysis.md
+      - Security model: explanation/security-model.md
+      - Safety and assurance: explanation/safety-and-assurance.md
+
+theme:
+  name: material
+  icon:
+    logo: material/database-eye
+  features:
+    - navigation.footer
+    - navigation.indexes
+    - navigation.sections
+    - navigation.tracking
+    - search.highlight
+    - search.suggest
+    - toc.follow
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: deep purple
+      accent: amber
+      toggle:
+        icon: material/weather-night
+        name: Use dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: deep purple
+      accent: amber
+      toggle:
+        icon: material/weather-sunny
+        name: Use light mode
+
+plugins:
+  - search
+
+markdown_extensions:
+  - attr_list
+  - tables
+  - toc:
+      permalink: true
+
+copyright: Apache-2.0

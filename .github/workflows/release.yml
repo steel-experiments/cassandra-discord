@@ -1,0 +1,215 @@
+# ABOUTME: Publishes the release image to ghcr.io when a strict version tag is pushed.
+# ABOUTME: Verifies both CPU architectures with the offline fixture smoke test before any push.
+#
+# Publication contract (Section 38.7):
+# - Only a tag push starts this workflow. A branch push never publishes an image.
+# - The tag filter accepts stable versions only: vMAJOR.MINOR.PATCH. A tag with a
+#   suffix, for example v1.2.3-rc1, does not publish and does not move `latest`.
+# - The smoke test from Section 46.6 runs on linux/amd64 and linux/arm64 before the
+#   push. The publish job runs only after both verify jobs pass.
+# - Operator contract: pin the version tag or the immutable digest for every
+#   deployment and upgrade. `latest` is a convenience pointer only. Never use
+#   `latest` for unattended upgrades of a stateful database application.
+# - The workflow creates a draft GitHub release that holds the digest summary. A
+#   human publishes the release. No step publishes it without a human action.
+
+name: Release image
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_NAME: ghcr.io/steel-experiments/cassandra-discord
+  # The pushed tag, for example v1.2.3. It is also the exact image tag that is published.
+  VERSION_TAG: ${{ github.ref_name }}
+  SOURCE_REVISION: ${{ github.sha }}
+  # The application reads CASSANDRA_SOURCE_REVISION through build-info (Section
+  # 35.2). Pass the revision as a build argument. The runtime stage must declare
+  # the argument and record it as ENV so the image names its own source.
+  BUILD_ARGS: |
+    CASSANDRA_SOURCE_REVISION=${{ github.sha }}
+  # The verify builds and the publish build use identical inputs and share the
+  # GitHub Actions build cache, one scope per architecture, so the publish
+  # build reuses the verified layers instead of compiling again.
+  OCI_LABELS: |
+    org.opencontainers.image.source=https://github.com/steel-experiments/cassandra-discord
+    org.opencontainers.image.revision=${{ github.sha }}
+    org.opencontainers.image.version=${{ github.ref_name }}
+    org.opencontainers.image.description=A quiet organizational-memory agent for one Discord server
+
+jobs:
+  verify:
+    name: Verify image on ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check that the tag names a stable package version
+        shell: bash
+        run: |
+          if [[ ! "${VERSION_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Tag ${VERSION_TAG} is not a stable version pattern (vMAJOR.MINOR.PATCH). No publication." >&2
+            exit 1
+          fi
+          package_version="$(jq -r .version package.json)"
+          if [ "${VERSION_TAG}" != "v${package_version}" ]; then
+            echo "Tag ${VERSION_TAG} does not match package.json version ${package_version}." >&2
+            echo "Set the version in package.json, commit, then push the tag again." >&2
+            exit 1
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Build image for the smoke test
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          load: true
+          push: false
+          provenance: false
+          tags: cassandra-discord:smoke-${{ matrix.arch }}
+          build-args: ${{ env.BUILD_ARGS }}
+          labels: ${{ env.OCI_LABELS }}
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+
+      - name: Run offline fixture smoke test
+        run: docker run --rm --network none cassandra-discord:smoke-${{ matrix.arch }} node dist/fixture-mode.js
+
+  publish:
+    name: Publish image to the registry
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_name: ${{ env.IMAGE_NAME }}
+      image_ref: ${{ steps.image.outputs.image_ref }}
+      digest: ${{ steps.push.outputs.digest }}
+      version: ${{ env.VERSION_TAG }}
+      revision: ${{ env.SOURCE_REVISION }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Log in to the container registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Both architectures passed the smoke test in the verify job. This step
+      # builds again from the same inputs and reuses the verified layers through
+      # the per-architecture build cache. The cache is a best-effort link: a
+      # cache miss rebuilds a layer from the same source, so the pushed bytes
+      # are not guaranteed to be identical to the smoke-tested images.
+      - name: Push multi-arch image
+        id: push
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: false
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ env.VERSION_TAG }}
+            ${{ env.IMAGE_NAME }}:latest
+          build-args: ${{ env.BUILD_ARGS }}
+          labels: ${{ env.OCI_LABELS }}
+          cache-from: |
+            type=gha,scope=amd64
+            type=gha,scope=arm64
+
+      - name: Record the image reference
+        id: image
+        run: echo "image_ref=${IMAGE_NAME}@${{ steps.push.outputs.digest }}" >> "$GITHUB_OUTPUT"
+
+      - name: Write the job summary
+        run: |
+          app_version="$(jq -r .version package.json)"
+          digest="${{ steps.push.outputs.digest }}"
+          {
+            echo "## Released image ${VERSION_TAG}"
+            echo
+            echo "- Image: \`${IMAGE_NAME}@${digest}\`"
+            echo "- Version tag: \`${IMAGE_NAME}:${VERSION_TAG}\` (application version ${app_version})"
+            echo "- Source revision: \`${SOURCE_REVISION}\`"
+            echo "- Verified architectures: linux/amd64 and linux/arm64. Each image started with"
+            echo "  the offline fixture smoke test (\`docker run --rm --network none\`) before the push."
+            echo
+            echo "### Operator contract"
+            echo
+            echo "Pin the version tag or the immutable digest for every deployment and upgrade:"
+            echo
+            echo '```'
+            echo "docker pull ${IMAGE_NAME}@${digest}"
+            echo '```'
+            echo
+            echo "\`latest\` is a convenience pointer. Never use \`latest\` for unattended upgrades"
+            echo "of a stateful database application."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  draft_release:
+    name: Draft the release with the digest
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # A draft only. A human reviews and publishes it; the workflow never does.
+      - name: Create a draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE_NAME_OUT: ${{ needs.publish.outputs.image_name }}
+          IMAGE_REF: ${{ needs.publish.outputs.image_ref }}
+          VERSION: ${{ needs.publish.outputs.version }}
+          REVISION: ${{ needs.publish.outputs.revision }}
+        run: |
+          if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "A release for $VERSION already exists. No draft created."
+            exit 0
+          fi
+          notes="$(mktemp)"
+          {
+            echo "## Image"
+            echo
+            echo "- Image: \`${IMAGE_REF}\`"
+            echo "- Version tag: \`${IMAGE_NAME_OUT}:${VERSION}\`"
+            echo "- Source revision: \`${REVISION}\`"
+            echo "- Verified architectures: linux/amd64 and linux/arm64. The offline fixture"
+            echo "  smoke test passed on both before the push."
+            echo
+            echo "## Operator contract"
+            echo
+            echo "Pin the version tag or the immutable digest for every deployment and upgrade."
+            echo "\`latest\` is a convenience pointer. Never use \`latest\` for unattended upgrades"
+            echo "of a stateful database application."
+          } > "$notes"
+          gh release create "$VERSION" --repo "$GITHUB_REPOSITORY" --draft --title "$VERSION" --notes-file "$notes"

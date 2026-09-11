@@ -1,0 +1,58 @@
+version: 1
+
+# Synthetic sample. Every ID below is fake. Replace them with real snowflakes
+# from your server, or mount your own file at this path.
+
+# Safe starter posture. A channel with no rule of its own is not read at all.
+# Loosen this only after you classify your channels.
+default:
+  ingest: false
+  visibility: restricted
+  allow_interventions: false
+
+# A category rule covers each channel it holds, unless a channel has its own
+# rule. Threads always follow their parent channel.
+categories:
+  # "Engineering" category: open work channels, org-visible.
+  "100000000000000001":
+    ingest: true
+    visibility: org
+    allow_interventions: false
+
+  # "Archive" category: old content. Not read, not used.
+  "100000000000000002":
+    ingest: false
+    visibility: excluded
+    allow_interventions: false
+
+# A channel rule wins over its category rule.
+channels:
+  # #general: open to the whole server.
+  "100000000000000011":
+    ingest: true
+    visibility: org
+    allow_interventions: false
+
+  # #engineering: open work channel.
+  "100000000000000012":
+    ingest: true
+    visibility: org
+    allow_interventions: false
+
+  # #leadership: private channel. Content stays inside it.
+  "100000000000000013":
+    ingest: true
+    visibility: restricted
+    allow_interventions: false
+
+# Where Cassandra sends review cards. "secure: true" is your claim that you
+# checked who can read this channel. The ID alone proves nothing. Check the
+# real audience before you trust this block. If you set
+# CASSANDRA_REVIEW_CHANNEL_ID, it must equal this id.
+review_channel:
+  id: "100000000000000021"
+  secure: true
+  accepts_scopes:
+    - org
+    - restricted
+    - review_only

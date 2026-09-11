@@ -1,0 +1,644 @@
+import { describe, it, expect } from 'vitest';
+import { rmSync } from 'node:fs';
+import type { SQLInputValue } from 'node:sqlite';
+import { openDatabase } from '../../src/db/database.js';
+import {
+  applyMigrations,
+  discoverMigrations,
+  listAppliedMigrations,
+  MigrationError,
+} from '../../src/db/migrations.js';
+import {
+  createTestDb,
+  copyMigrationsToTemp,
+  writeMigration,
+  makeTempDir,
+} from '../helpers/db.js';
+
+describe('migrations runner', () => {
+  it('applies all migrations on first run', () => {
+    const t = createTestDb();
+    const applied = listAppliedMigrations(t.db);
+    expect(applied.map((m) => m.version)).toEqual(Array.from({ length: 37 }, (_, i) => i + 1));
+    t.cleanup();
+  });
+
+  it('is idempotent on repeated runs (applies nothing new)', () => {
+    const t = createTestDb();
+    const result = applyMigrations(t.db, copyMigrationsToTemp());
+    expect(result.applied).toHaveLength(0);
+    expect(listAppliedMigrations(t.db).map((m) => m.version)).toEqual(Array.from({ length: 37 }, (_, i) => i + 1));
+    t.cleanup();
+  });
+
+  it('upgrades an existing version 5 database through all new migrations', () => {
+    const oldDir = copyMigrationsToTemp();
+    for (const name of [
+      '006_message_tombstones.sql',
+      '007_outbox_repair.sql',
+      '008_attachment_file_purges.sql',
+      '009_reaction_baselines.sql',
+      '010_reconcile_cursor.sql',
+      '011_historical_episodes.sql',
+      '012_historical_campaigns.sql',
+      '013_oauth_login_sessions.sql',
+      '014_oauth_authorization_codes.sql',
+      '015_oauth_access_tokens.sql',
+      '016_direct_answer_requests.sql',
+      '017_proposal_review_reason.sql',
+      '018_deep_recaps.sql',
+      '019_deep_recap_retry_lineage.sql',
+      '020_deep_recap_model_calls.sql',
+      '021_deep_recap_adaptive_delivery.sql',
+      '022_channel_policy_reviews.sql',
+      '023_inspector.sql',
+      '024_inspector_indexes.sql',
+      '025_inspector_sort_indexes.sql',
+      '026_direct_answer_job_index.sql',
+      '027_scheduled_review_subjects.sql',
+      '028_inspector_channel_pagination.sql',
+      '029_inspector_archive_pagination.sql',
+      '030_inspector_memory_recent_sort.sql',
+      '031_scheduled_review_routing.sql',
+      '032_proposal_review_message_index.sql',
+      '033_inspector_run_observability.sql',
+      '034_agent_run_usage_breakdown.sql',
+      '035_episode_reasoning_shadow.sql',
+      '036_agent_run_execution_start.sql',
+      '037_ingestion_recovery.sql',
+    ]) rmSync(`${oldDir}/${name}`);
+    const dbPath = `${oldDir}/upgrade.sqlite`;
+    const db = openDatabase(dbPath);
+    applyMigrations(db, oldDir);
+    expect(listAppliedMigrations(db).map((m) => m.version)).toEqual([1, 2, 3, 4, 5]);
+    db.prepare("INSERT INTO guilds (id,name,discovered_at_ms,updated_at_ms) VALUES ('g-upgrade','G',1,1)").run();
+    db.prepare("INSERT INTO channels (id,guild_id,type,discovered_at_ms,updated_at_ms) VALUES ('c-upgrade','g-upgrade',0,1,1)").run();
+    db.prepare("INSERT INTO agent_runs (id,guild_id,run_type,prompt_version,provider,model,status,started_at_ms) VALUES ('run-upgrade','g-upgrade','episode','p','p','m','completed',1)").run();
+    db.prepare("INSERT INTO proposals (id,run_id,target_channel_id,status,computed_score,reason,evidence_message_ids_json,created_at_ms,updated_at_ms) VALUES ('proposal-upgrade','run-upgrade','c-upgrade','observed',0,'legacy','[]',1,1)").run();
+
+    applyMigrations(db, copyMigrationsToTemp());
+    expect(listAppliedMigrations(db).map((m) => m.version)).toEqual(Array.from({ length: 37 }, (_, i) => i + 1));
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE name='message_tombstones'").get()).toBeDefined();
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE name='attachment_file_purges'").get()).toBeDefined();
+    const syncColumns = db.prepare('PRAGMA table_info(sync_cursors)').all() as Array<{ name: string }>;
+    expect(syncColumns.some((column) => column.name === 'reconcile_before_message_id')).toBe(true);
+    const proposalColumns = db.prepare('PRAGMA table_info(proposals)').all() as Array<{ name: string }>;
+    expect(proposalColumns.some((column) => column.name === 'review_reason')).toBe(true);
+    expect(proposalColumns.some((column) => column.name === 'topic_key')).toBe(true);
+    expect(proposalColumns.some((column) => column.name === 'policy_decision_json')).toBe(true);
+    const run = db.prepare(`SELECT model_turns_json,uncached_input_tokens,
+      cache_read_tokens,cache_write_tokens,cache_write_1h_tokens,reasoning_tokens,
+      provider_total_tokens,uncached_input_cost_usd,output_cost_usd,
+      cache_read_cost_usd,cache_write_cost_usd,thinking_level
+      FROM agent_runs WHERE id='run-upgrade'`).get() as Record<string, unknown>;
+    expect(run.model_turns_json).toBe('[]');
+    for (const [key, value] of Object.entries(run)) {
+      if (key !== 'model_turns_json') expect(value).toBeNull();
+    }
+    expect((db.prepare("SELECT policy_decision_json FROM proposals WHERE id='proposal-upgrade'").get() as { policy_decision_json: string | null }).policy_decision_json).toBeNull();
+    expect((db.prepare("SELECT shadow_of_run_id,shadow_comparison_json FROM agent_runs WHERE id='run-upgrade'").get() as Record<string, unknown>))
+      .toEqual({ shadow_of_run_id: null, shadow_comparison_json: null });
+    expect((db.prepare("SELECT execution_started_at_ms FROM agent_runs WHERE id='run-upgrade'").get() as { execution_started_at_ms: number | null }).execution_started_at_ms)
+      .toBeNull();
+    expect(() => db.prepare("INSERT INTO agent_runs (id,guild_id,run_type,prompt_version,provider,model,status,started_at_ms,model_turns_json) VALUES ('bad-run','missing','episode','p','p','m','running',1,'{}')").run()).toThrow();
+    expect(db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'scheduled_proposal_subjects'",
+    ).get()).toBeDefined();
+    expect(db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'scheduled_proposal_subjects_memory_idx'",
+    ).get()).toBeDefined();
+    expect(db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'scheduled_review_dispatch_state'",
+    ).get()).toBeDefined();
+    expect(db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'scheduled_review_cohort_subject_leases'",
+    ).get()).toBeDefined();
+    db.close();
+  });
+
+  it('enforces migration 034 usage constraints', () => {
+    const t = createTestDb();
+    t.db.prepare("INSERT INTO guilds (id,name,discovered_at_ms,updated_at_ms) VALUES ('g-usage','G',1,1)").run();
+    t.db.prepare(`INSERT INTO agent_runs
+      (id,guild_id,run_type,prompt_version,provider,model,status,started_at_ms)
+      VALUES ('run-usage','g-usage','episode','p','faux','faux','completed',1)`).run();
+
+    for (const column of [
+      'uncached_input_tokens',
+      'cache_read_tokens',
+      'cache_write_tokens',
+      'cache_write_1h_tokens',
+      'reasoning_tokens',
+      'provider_total_tokens',
+      'uncached_input_cost_usd',
+      'output_cost_usd',
+      'cache_read_cost_usd',
+      'cache_write_cost_usd',
+    ]) {
+      expect(() => t.db.prepare(`UPDATE agent_runs SET ${column} = -1 WHERE id = ?`).run('run-usage'))
+        .toThrow();
+    }
+
+    for (const level of ['minimal', 'low', 'medium', 'high', 'xhigh', 'max']) {
+      t.db.prepare('UPDATE agent_runs SET thinking_level = ? WHERE id = ?').run(level, 'run-usage');
+    }
+    t.db.prepare('UPDATE agent_runs SET thinking_level = NULL WHERE id = ?').run('run-usage');
+    expect(() => t.db.prepare('UPDATE agent_runs SET thinking_level = ? WHERE id = ?')
+      .run('off', 'run-usage')).toThrow();
+    t.cleanup();
+  });
+
+  it('enforces migration 035 shadow linkage and comparison constraints', () => {
+    const t = createTestDb();
+    t.db.prepare("INSERT INTO guilds (id,name,discovered_at_ms,updated_at_ms) VALUES ('g-shadow','G',1,1)").run();
+    const insert = t.db.prepare(`INSERT INTO agent_runs
+      (id,guild_id,run_type,prompt_version,provider,model,status,started_at_ms,shadow_of_run_id)
+      VALUES (?,?,?,?,?,?,?, ?,?)`);
+    insert.run('authoritative', 'g-shadow', 'episode', 'p', 'faux', 'faux', 'completed', 1, null);
+    insert.run('shadow', 'g-shadow', 'episode', 'p', 'faux', 'faux', 'completed', 2, 'authoritative');
+    expect(() => insert.run(
+      'duplicate-shadow', 'g-shadow', 'episode', 'p', 'faux', 'faux', 'completed', 3, 'authoritative',
+    )).toThrow();
+    expect(() => t.db.prepare('UPDATE agent_runs SET shadow_comparison_json=? WHERE id=?')
+      .run('[]', 'shadow')).toThrow();
+    t.db.prepare('UPDATE agent_runs SET shadow_comparison_json=? WHERE id=?')
+      .run('{"version":1}', 'shadow');
+    expect(() => insert.run(
+      'missing-parent', 'g-shadow', 'episode', 'p', 'faux', 'faux', 'completed', 4, 'absent',
+    )).toThrow();
+    t.cleanup();
+  });
+
+  it('keeps migration 036 execution timing nullable for legacy runs and non-negative', () => {
+    const t = createTestDb();
+    t.db.prepare("INSERT INTO guilds (id,name,discovered_at_ms,updated_at_ms) VALUES ('g-time','G',1,1)").run();
+    t.db.prepare(`INSERT INTO agent_runs
+      (id,guild_id,run_type,prompt_version,provider,model,status,started_at_ms)
+      VALUES ('legacy-time','g-time','episode','p','faux','faux','completed',1)`).run();
+    expect(t.db.prepare('SELECT execution_started_at_ms FROM agent_runs WHERE id=?')
+      .get('legacy-time')).toEqual({ execution_started_at_ms: null });
+    expect(() => t.db.prepare('UPDATE agent_runs SET execution_started_at_ms=-1 WHERE id=?')
+      .run('legacy-time')).toThrow();
+    t.db.prepare('UPDATE agent_runs SET execution_started_at_ms=2 WHERE id=?').run('legacy-time');
+    expect(t.db.prepare('SELECT execution_started_at_ms FROM agent_runs WHERE id=?')
+      .get('legacy-time')).toEqual({ execution_started_at_ms: 2 });
+    t.cleanup();
+  });
+
+  it('upgrades version 18 recap rows into explicit retry lineages', () => {
+    const v18Dir = copyMigrationsToTemp();
+    rmSync(`${v18Dir}/019_deep_recap_retry_lineage.sql`);
+    rmSync(`${v18Dir}/020_deep_recap_model_calls.sql`);
+    rmSync(`${v18Dir}/021_deep_recap_adaptive_delivery.sql`);
+    rmSync(`${v18Dir}/022_channel_policy_reviews.sql`);
+    rmSync(`${v18Dir}/023_inspector.sql`);
+    rmSync(`${v18Dir}/024_inspector_indexes.sql`);
+    rmSync(`${v18Dir}/025_inspector_sort_indexes.sql`);
+    rmSync(`${v18Dir}/026_direct_answer_job_index.sql`);
+    rmSync(`${v18Dir}/027_scheduled_review_subjects.sql`);
+    rmSync(`${v18Dir}/028_inspector_channel_pagination.sql`);
+    rmSync(`${v18Dir}/029_inspector_archive_pagination.sql`);
+    rmSync(`${v18Dir}/030_inspector_memory_recent_sort.sql`);
+    rmSync(`${v18Dir}/031_scheduled_review_routing.sql`);
+    rmSync(`${v18Dir}/032_proposal_review_message_index.sql`);
+    rmSync(`${v18Dir}/033_inspector_run_observability.sql`);
+    rmSync(`${v18Dir}/034_agent_run_usage_breakdown.sql`);
+    rmSync(`${v18Dir}/035_episode_reasoning_shadow.sql`);
+    rmSync(`${v18Dir}/036_agent_run_execution_start.sql`);
+    rmSync(`${v18Dir}/037_ingestion_recovery.sql`);
+    const db = openDatabase(`${v18Dir}/lineage-upgrade.sqlite`);
+    applyMigrations(db, v18Dir);
+    db.prepare("INSERT INTO guilds (id,name,discovered_at_ms,updated_at_ms) VALUES ('g-lineage','G',1,1)").run();
+    db.prepare(`INSERT INTO channels
+      (id,guild_id,type,visibility_class,discovered_at_ms,updated_at_ms)
+      VALUES ('c-lineage','g-lineage',0,'org',1,1)`).run();
+    db.prepare(`INSERT INTO deep_recap_requests
+      (id,guild_id,target_channel_id,requested_by_user_id,after_at_ms,before_at_ms,
+       budget_usd,created_at_ms,updated_at_ms)
+      VALUES ('recap-lineage','g-lineage','c-lineage','u',1,2,5,1,1)`).run();
+
+    applyMigrations(db, copyMigrationsToTemp());
+
+    expect(db.prepare(`SELECT retry_of_request_id,retry_root_request_id
+      FROM deep_recap_requests WHERE id='recap-lineage'`).get()).toEqual({
+      retry_of_request_id: null,
+      retry_root_request_id: 'recap-lineage',
+    });
+    expect(() => db.prepare(`UPDATE deep_recap_requests
+      SET retry_of_request_id='missing' WHERE id='recap-lineage'`).run()).toThrow();
+    expect(() => db.prepare(`UPDATE deep_recap_requests
+      SET retry_root_request_id='missing' WHERE id='recap-lineage'`).run()).toThrow();
+    db.prepare(`INSERT INTO deep_recap_requests
+      (id,guild_id,target_channel_id,requested_by_user_id,retry_of_request_id,
+       retry_root_request_id,after_at_ms,before_at_ms,budget_usd,status,
+       planned_chunks,completed_chunks,last_error_category,created_at_ms,updated_at_ms,
+       completed_at_ms)
+      VALUES ('retry-one','g-lineage','c-lineage','u','recap-lineage',
+              'recap-lineage',1,2,5,'failed',1,1,'processing_error',2,2,2)`).run();
+    expect(() => db.prepare(`INSERT INTO deep_recap_requests
+      (id,guild_id,target_channel_id,requested_by_user_id,retry_of_request_id,
+       retry_root_request_id,after_at_ms,before_at_ms,budget_usd,status,
+       planned_chunks,completed_chunks,last_error_category,created_at_ms,updated_at_ms,
+       completed_at_ms)
+      VALUES ('retry-branch','g-lineage','c-lineage','u','recap-lineage',
+              'recap-lineage',1,2,5,'failed',1,1,'processing_error',3,3,3)`).run())
+      .toThrow(/UNIQUE constraint failed/);
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE name='deep_recap_retry_root_idx'").get())
+      .toBeDefined();
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE name='deep_recap_retry_one_child_idx'").get())
+      .toBeDefined();
+    db.close();
+  });
+
+  it('upgrades version 19 recap spend into timestamped model-call rows', () => {
+    const v19Dir = copyMigrationsToTemp();
+    rmSync(`${v19Dir}/020_deep_recap_model_calls.sql`);
+    rmSync(`${v19Dir}/021_deep_recap_adaptive_delivery.sql`);
+    rmSync(`${v19Dir}/022_channel_policy_reviews.sql`);
+    rmSync(`${v19Dir}/023_inspector.sql`);
+    rmSync(`${v19Dir}/024_inspector_indexes.sql`);
+    rmSync(`${v19Dir}/025_inspector_sort_indexes.sql`);
+    rmSync(`${v19Dir}/026_direct_answer_job_index.sql`);
+    rmSync(`${v19Dir}/027_scheduled_review_subjects.sql`);
+    rmSync(`${v19Dir}/028_inspector_channel_pagination.sql`);
+    rmSync(`${v19Dir}/029_inspector_archive_pagination.sql`);
+    rmSync(`${v19Dir}/030_inspector_memory_recent_sort.sql`);
+    rmSync(`${v19Dir}/031_scheduled_review_routing.sql`);
+    rmSync(`${v19Dir}/032_proposal_review_message_index.sql`);
+    rmSync(`${v19Dir}/033_inspector_run_observability.sql`);
+    rmSync(`${v19Dir}/034_agent_run_usage_breakdown.sql`);
+    rmSync(`${v19Dir}/035_episode_reasoning_shadow.sql`);
+    rmSync(`${v19Dir}/036_agent_run_execution_start.sql`);
+    rmSync(`${v19Dir}/037_ingestion_recovery.sql`);
+    const db = openDatabase(`${v19Dir}/cost-upgrade.sqlite`);
+    applyMigrations(db, v19Dir);
+    db.prepare("INSERT INTO guilds (id,name,discovered_at_ms,updated_at_ms) VALUES ('g-cost','G',1,1)").run();
+    db.prepare(`INSERT INTO channels
+      (id,guild_id,type,visibility_class,discovered_at_ms,updated_at_ms)
+      VALUES ('c-cost','g-cost',0,'org',1,1)`).run();
+    db.prepare(`INSERT INTO agent_runs
+      (id,guild_id,run_type,prompt_version,provider,model,status,started_at_ms,
+       ended_at_ms,cost_usd)
+      VALUES ('run-cost','g-cost','direct_answer','p','faux','faux','completed',10,11,.20)`).run();
+    db.prepare(`INSERT INTO deep_recap_requests
+      (id,guild_id,target_channel_id,requested_by_user_id,retry_root_request_id,
+       after_at_ms,before_at_ms,budget_usd,spent_usd,synthesis_cost_usd,status,
+       planned_chunks,completed_chunks,created_at_ms,updated_at_ms,completed_at_ms)
+      VALUES ('recap-cost','g-cost','c-cost','u','recap-cost',1,20,5,.30,.10,
+              'completed',1,1,1,20,20)`).run();
+    db.prepare(`INSERT INTO deep_recap_chunks
+      (request_id,ordinal,after_at_ms,before_at_ms,status,run_id,cost_usd,
+       created_at_ms,updated_at_ms)
+      VALUES ('recap-cost',0,1,20,'completed','run-cost',.20,1,11)`).run();
+
+    applyMigrations(db, copyMigrationsToTemp());
+
+    expect(db.prepare(`SELECT run_id,phase,chunk_ordinal,started_at_ms,cost_usd
+      FROM deep_recap_model_calls ORDER BY phase`).all()).toEqual([
+      { run_id: 'run-cost', phase: 'chunk', chunk_ordinal: 0, started_at_ms: 10, cost_usd: 0.2 },
+      { run_id: null, phase: 'synthesis', chunk_ordinal: null, started_at_ms: 20, cost_usd: 0.1 },
+    ]);
+    expect(() => db.prepare(`INSERT INTO deep_recap_model_calls
+      (id,request_id,run_id,phase,chunk_ordinal,started_at_ms,created_at_ms,updated_at_ms)
+      VALUES ('duplicate-run','recap-cost','run-cost','synthesis',NULL,30,30,30)`).run())
+      .toThrow(/UNIQUE constraint failed/);
+    // A pre-call reservation must be legal before its agent_runs row exists.
+    db.prepare(`INSERT INTO deep_recap_model_calls
+      (id,request_id,run_id,phase,chunk_ordinal,started_at_ms,created_at_ms,updated_at_ms)
+      VALUES ('reserved','recap-cost','future-run','synthesis',NULL,30,30,30)`).run();
+    db.close();
+  });
+
+  it('rolls back a failed migration while keeping prior ones', () => {
+    const dir = copyMigrationsToTemp();
+    writeMigration(dir, '038_bad.sql', 'CREATE TABLE definitely valid syntax NOT;');
+    const db = openDatabase(`${dir}/db.sqlite`);
+    expect(() => applyMigrations(db, dir)).toThrow();
+    expect(listAppliedMigrations(db).map((m) => m.version)).toEqual(Array.from({ length: 37 }, (_, i) => i + 1));
+    db.close();
+  });
+
+  it('rejects a modified already-applied migration (checksum drift)', () => {
+    const dir = copyMigrationsToTemp();
+    const db = openDatabase(`${dir}/db.sqlite`);
+    applyMigrations(db, dir);
+    writeMigration(dir, '001_core.sql', '-- tampered\n' + '-- changed content\n');
+    expect(() => applyMigrations(db, dir)).toThrow(MigrationError);
+    db.close();
+  });
+
+  it('rejects duplicate migration versions', () => {
+    const dir = makeTempDir();
+    writeMigration(dir, '001_a.sql', 'SELECT 1;');
+    writeMigration(dir, '001_b.sql', 'SELECT 1;');
+    expect(() => discoverMigrations(dir)).toThrow(MigrationError);
+  });
+
+  it('rejects a gap in migration versions', () => {
+    const dir = makeTempDir();
+    writeMigration(dir, '001_a.sql', 'SELECT 1;');
+    writeMigration(dir, '003_b.sql', 'SELECT 1;');
+    expect(() => discoverMigrations(dir)).toThrow(MigrationError);
+  });
+
+  it('rejects an applied version whose file is missing', () => {
+    const dir = copyMigrationsToTemp();
+    const db = openDatabase(`${dir}/db.sqlite`);
+    applyMigrations(db, dir);
+    // Re-open a fresh DB but point at a dir that only has 001-003 (drop 004).
+    rmSync(`${dir}/004_fts.sql`);
+    expect(() => applyMigrations(db, dir)).toThrow(MigrationError);
+    db.close();
+  });
+});
+
+describe('core storage migration integrity', () => {
+  it('uses the live global time index for org-wide recent activity scans', () => {
+    const t = createTestDb();
+    const plan = t.db.prepare(`EXPLAIN QUERY PLAN
+      SELECT m.id
+        FROM messages m
+        JOIN channels c ON c.id = m.channel_id
+       WHERE m.deleted_at_ms IS NULL
+         AND m.created_at_ms >= ? AND m.created_at_ms < ?
+         AND c.deleted_at_ms IS NULL
+         AND c.ingest_enabled = 1
+         AND c.visibility_class = 'org'
+       ORDER BY m.created_at_ms ASC, m.id ASC`).all(1, 2) as Array<{ detail: string }>;
+    expect(plan.some((row) => row.detail.includes('messages_recent_live_idx'))).toBe(true);
+    t.cleanup();
+  });
+
+  it('rejects invalid visibility_class enum values', () => {
+    const t = createTestDb();
+    expect(() =>
+      t.db
+        .prepare(
+          `INSERT INTO channels (id, guild_id, type, visibility_class, discovered_at_ms, updated_at_ms)
+           VALUES ('c1','100000000000000001',0,'public',1,1)`,
+        )
+        .run(),
+    ).toThrow();
+    t.cleanup();
+  });
+
+  it('rejects boolean values outside the checked domain', () => {
+    const t = createTestDb();
+    expect(() =>
+      t.db
+        .prepare(
+          `INSERT INTO channels (id, guild_id, type, is_thread, visibility_class, discovered_at_ms, updated_at_ms)
+           VALUES ('c1','100000000000000001',0,2,'restricted',1,1)`,
+        )
+        .run(),
+    ).toThrow();
+    t.cleanup();
+  });
+});
+
+describe('inspector migration integrity', () => {
+  it('backs every inspector cursor listing with an index, not a temp sort', () => {
+    const t = createTestDb();
+    const episodePlan = t.db.prepare(`EXPLAIN QUERY PLAN
+      SELECT id FROM episodes ORDER BY last_activity_at_ms DESC, id DESC LIMIT 21`)
+      .all() as Array<{ detail: string }>;
+    expect(episodePlan.some((row) => row.detail.includes('episodes_last_activity_idx'))).toBe(true);
+    expect(episodePlan.some((row) => row.detail.includes('TEMP B-TREE'))).toBe(false);
+
+    const runPlan = t.db.prepare(`EXPLAIN QUERY PLAN
+      SELECT id FROM agent_runs ORDER BY started_at_ms DESC, id DESC LIMIT 21`)
+      .all() as Array<{ detail: string }>;
+    expect(runPlan.some((row) => row.detail.includes('agent_runs_started_idx'))).toBe(true);
+    expect(runPlan.some((row) => row.detail.includes('TEMP B-TREE'))).toBe(false);
+
+    const channelPlan = t.db.prepare(`EXPLAIN QUERY PLAN
+      SELECT id FROM channels WHERE is_thread = 0
+      ORDER BY (deleted_at_ms IS NOT NULL), LOWER(COALESCE(name, id)), id LIMIT 21`)
+      .all() as Array<{ detail: string }>;
+    expect(channelPlan.some((row) => row.detail.includes('channels_inspector_kind_name_idx'))).toBe(true);
+    expect(channelPlan.some((row) => row.detail.includes('TEMP B-TREE'))).toBe(false);
+
+    const plans: Array<{ sql: string; params?: SQLInputValue[]; index: string }> = [
+      {
+        sql: `WITH effective AS (SELECT id FROM memories)
+          SELECT mem.id FROM memories mem INDEXED BY memories_inspector_archive_idx
+          CROSS JOIN effective eff ON eff.id = mem.id
+          ORDER BY mem.importance DESC, mem.last_confirmed_at_ms DESC, mem.id DESC LIMIT 21`,
+        index: 'memories_inspector_archive_idx',
+      },
+      {
+        sql: `WITH effective AS (SELECT id FROM memories)
+          SELECT mem.id FROM memories mem INDEXED BY memories_inspector_recent_idx
+          CROSS JOIN effective eff ON eff.id = mem.id
+          ORDER BY mem.last_confirmed_at_ms DESC, mem.id DESC LIMIT 21`,
+        index: 'memories_inspector_recent_idx',
+      },
+      {
+        sql: `SELECT me.message_id FROM memory_evidence me INDEXED BY memory_evidence_inspector_archive_idx
+          CROSS JOIN messages m ON m.id = me.message_id
+          CROSS JOIN channels c ON c.id = m.channel_id
+          WHERE me.memory_id = ? ORDER BY me.created_at_ms, me.message_id, me.stance LIMIT 21`,
+        params: ['mem'],
+        index: 'memory_evidence_inspector_archive_idx',
+      },
+      {
+        sql: `SELECT p.id FROM proposals p INDEXED BY proposals_inspector_archive_idx
+          CROSS JOIN channels c ON c.id = p.target_channel_id
+          ORDER BY p.created_at_ms DESC, p.id DESC LIMIT 21`,
+        index: 'proposals_inspector_archive_idx',
+      },
+      {
+        sql: `SELECT o.id FROM outbox o INDEXED BY outbox_inspector_archive_idx
+          CROSS JOIN channels c ON c.id = o.channel_id
+          ORDER BY o.created_at_ms DESC, o.id DESC LIMIT 21`,
+        index: 'outbox_inspector_archive_idx',
+      },
+      {
+        sql: `SELECT id FROM jobs INDEXED BY jobs_inspector_archive_idx
+          ORDER BY created_at_ms DESC, id DESC LIMIT 21`,
+        index: 'jobs_inspector_archive_idx',
+      },
+      {
+        sql: `SELECT id FROM admin_events INDEXED BY admin_events_inspector_archive_idx
+          ORDER BY created_at_ms DESC, id DESC LIMIT 21`,
+        index: 'admin_events_inspector_archive_idx',
+      },
+    ];
+    for (const item of plans) {
+      const plan = t.db.prepare(`EXPLAIN QUERY PLAN ${item.sql}`).all(...(item.params ?? [])) as Array<{ detail: string }>;
+      expect(plan.some((row) => row.detail.includes(item.index)), item.index).toBe(true);
+      expect(plan.some((row) => row.detail.includes('TEMP B-TREE')), item.index).toBe(false);
+    }
+    t.cleanup();
+  });
+});
+
+describe('memory migration integrity', () => {
+  it('enforces unique episode-message ordinals', () => {
+    const t = createTestDb();
+    t.db
+      .prepare(
+        "INSERT INTO guilds (id,name,discovered_at_ms,updated_at_ms) VALUES ('g1','G',1,1)",
+      )
+      .run();
+    t.db
+      .prepare(
+        "INSERT INTO channels (id,guild_id,type,visibility_class,discovered_at_ms,updated_at_ms) VALUES ('ch','g1',0,'org',1,1)",
+      )
+      .run();
+    t.db
+      .prepare(
+        "INSERT INTO messages (id,guild_id,channel_id,author_display_name,content,created_at_ms,ingested_at_ms,updated_at_ms) VALUES ('m','g1','ch','a','',1,1,1)",
+      )
+      .run();
+    t.db
+      .prepare(
+        "INSERT INTO episodes (id,guild_id,conversation_channel_id,status,started_at_ms,last_activity_at_ms,created_at_ms,updated_at_ms) VALUES ('e1','g1','ch','open',1,1,1,1)",
+      )
+      .run();
+    t.db
+      .prepare(
+        "INSERT INTO episode_messages (episode_id,message_id,ordinal) VALUES ('e1','m',1)",
+      )
+      .run();
+    expect(() =>
+      t.db
+        .prepare(
+          "INSERT INTO episode_messages (episode_id,message_id,ordinal) VALUES ('e1','m',1)",
+        )
+        .run(),
+    ).toThrow();
+    t.cleanup();
+  });
+
+  it('cascades memory evidence deletion when a memory is removed', () => {
+    const t = createTestDb();
+    t.db
+      .prepare("INSERT INTO guilds (id,name,discovered_at_ms,updated_at_ms) VALUES ('g1','G',1,1)")
+      .run();
+    t.db
+      .prepare(
+        "INSERT INTO channels (id,guild_id,type,visibility_class,discovered_at_ms,updated_at_ms) VALUES ('ch','g1',0,'org',1,1)",
+      )
+      .run();
+    t.db
+      .prepare(
+        "INSERT INTO messages (id,guild_id,channel_id,author_display_name,content,created_at_ms,ingested_at_ms,updated_at_ms) VALUES ('m','g1','ch','a','x',1,1,1)",
+      )
+      .run();
+    t.db
+      .prepare(
+        `INSERT INTO memories (id,guild_id,scope_type,type,statement,confidence,importance,first_seen_at_ms,last_confirmed_at_ms,created_at_ms,updated_at_ms)
+         VALUES ('mem1','g1','org','decision','decide',0.8,0.5,1,1,1,1)`,
+      )
+      .run();
+    t.db
+      .prepare(
+        "INSERT INTO memory_evidence (memory_id,message_id,stance,created_at_ms) VALUES ('mem1','m','origin',1)",
+      )
+      .run();
+    t.db.prepare("DELETE FROM memories WHERE id = 'mem1'").run();
+    const ev = t.db.prepare('SELECT count(*) AS n FROM memory_evidence WHERE memory_id = ?').get('mem1') as { n: number };
+    expect(ev.n).toBe(0);
+    t.cleanup();
+  });
+});
+
+describe('operations migration integrity', () => {
+  it('enforces direct-request identity and terminal outcome invariants', () => {
+    const t = createTestDb();
+    t.db.prepare(
+      "INSERT INTO guilds (id,name,discovered_at_ms,updated_at_ms) VALUES ('g-direct','G',1,1)",
+    ).run();
+    t.db.prepare(`INSERT INTO direct_answer_requests (
+      source_message_id, guild_id, target_channel_id, question_created_at_ms,
+      deadline_at_ms, response_intent_key, created_at_ms, updated_at_ms
+    ) VALUES ('m-direct-1','g-direct','c-direct',1,121000,'intent-direct-1',1,1)`).run();
+
+    expect(() => t.db.prepare(`INSERT INTO direct_answer_requests (
+      source_message_id, guild_id, target_channel_id, question_created_at_ms,
+      deadline_at_ms, response_intent_key, created_at_ms, updated_at_ms
+    ) VALUES ('m-direct-2','g-direct','c-direct',2,121001,'intent-direct-1',2,2)`).run())
+      .toThrow();
+    expect(() => t.db.prepare(`UPDATE direct_answer_requests
+      SET outcome_kind='fallback', reason_category='model_error', completed_at_ms=2
+      WHERE source_message_id='m-direct-1'`).run()).toThrow();
+    expect(() => t.db.prepare(`UPDATE direct_answer_requests
+      SET outcome_kind='partial', reason_category='none', run_id=NULL,
+          coverage_complete=1, completed_at_ms=2
+      WHERE source_message_id='m-direct-1'`).run()).toThrow();
+
+    t.db.prepare(`INSERT INTO channels (
+      id, guild_id, type, visibility_class, discovered_at_ms, updated_at_ms
+    ) VALUES ('c-direct','g-direct',0,'org',1,1)`).run();
+    t.db.prepare(`INSERT INTO agent_runs (
+      id, guild_id, run_type, prompt_version, provider, model, status, started_at_ms
+    ) VALUES ('run-direct','g-direct','direct_answer','pv','faux','faux','completed',1)`).run();
+    t.db.prepare(`INSERT INTO outbox (
+      id, channel_id, content, dedupe_key, next_attempt_at_ms, created_at_ms, updated_at_ms
+    ) VALUES ('out-direct','c-direct','reply','direct-intent',1,1,1)`).run();
+    t.db.prepare(`INSERT INTO direct_answer_requests (
+      source_message_id, run_id, outbox_id, guild_id, target_channel_id,
+      question_created_at_ms, deadline_at_ms, response_intent_key, outcome_kind,
+      reason_category, created_at_ms, completed_at_ms, updated_at_ms
+    ) VALUES (
+      'm-direct-terminal','run-direct','out-direct','g-direct','c-direct',
+      1,121000,'intent-direct-terminal','primary','none',1,2,2
+    )`).run();
+    expect(() => t.db.prepare("DELETE FROM outbox WHERE id='out-direct'").run()).toThrow();
+    expect(() => t.db.prepare("DELETE FROM agent_runs WHERE id='run-direct'").run()).toThrow();
+    t.cleanup();
+  });
+
+  it('enforces deep-recap bounds, terminal state, and one active request per target', () => {
+    const t = createTestDb();
+    t.db.prepare("INSERT INTO guilds (id,name,discovered_at_ms,updated_at_ms) VALUES ('g-recap','G',1,1)").run();
+    t.db.prepare(`INSERT INTO channels
+      (id,guild_id,type,visibility_class,discovered_at_ms,updated_at_ms)
+      VALUES ('c-recap','g-recap',0,'org',1,1)`).run();
+    const insert = t.db.prepare(`INSERT INTO deep_recap_requests
+      (id,guild_id,target_channel_id,requested_by_user_id,after_at_ms,before_at_ms,
+       budget_usd,created_at_ms,updated_at_ms)
+      VALUES (?,'g-recap','c-recap','u',1,2,1,1,1)`);
+    insert.run('recap-1');
+    expect(() => insert.run('recap-2')).toThrow();
+    expect(() => t.db.prepare("UPDATE deep_recap_requests SET status='completed' WHERE id='recap-1'").run())
+      .toThrow();
+    expect(() => t.db.prepare(`INSERT INTO deep_recap_chunks
+      (request_id,ordinal,after_at_ms,before_at_ms,created_at_ms,updated_at_ms)
+      VALUES ('recap-1',0,2,1,1,1)`).run()).toThrow();
+    t.cleanup();
+  });
+
+  it('enforces active-job uniqueness on (type, unique_key)', () => {
+    const t = createTestDb();
+    const insert = t.db.prepare(
+      "INSERT INTO jobs (id,type,unique_key,payload_json,run_after_ms,created_at_ms,updated_at_ms) VALUES (?,?,?,?,1,1,1)",
+    );
+    insert.run('j1', 'episode_review', 'uk-1', '{}');
+    expect(() => insert.run('j2', 'episode_review', 'uk-1', '{}')).toThrow();
+    // A different unique_key, or a terminal status, is allowed.
+    insert.run('j3', 'episode_review', 'uk-2', '{}');
+    t.cleanup();
+  });
+
+  it('enforces outbox dedupe_key uniqueness', () => {
+    const t = createTestDb();
+    t.db
+      .prepare(
+        "INSERT INTO guilds (id,name,discovered_at_ms,updated_at_ms) VALUES ('g1','G',1,1)",
+      )
+      .run();
+    t.db
+      .prepare(
+        "INSERT INTO channels (id,guild_id,type,visibility_class,discovered_at_ms,updated_at_ms) VALUES ('ch','g1',0,'org',1,1)",
+      )
+      .run();
+    const insert = t.db.prepare(
+      "INSERT INTO outbox (id,channel_id,content,dedupe_key,next_attempt_at_ms,created_at_ms,updated_at_ms) VALUES ('ch',?,'c',?,1,1,1)",
+    );
+    insert.run('ch', 'dk-1');
+    expect(() => insert.run('ch', 'dk-1')).toThrow();
+    t.cleanup();
+  });
+});

@@ -1,0 +1,48 @@
+{
+  "name": "cassandra-discord",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cassandra — a quiet organizational-memory agent for one Discord server.",
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "exports": {
+    ".": "./dist/main.js"
+  },
+  "scripts": {
+    "verify:sqlite": "node scripts/verify-sqlite.mjs",
+    "docs:check-public": "node scripts/check-public-docs.mjs docs",
+    "docs:check-links": "node scripts/check-doc-links.mjs",
+    "docs:check-links:external": "node scripts/check-doc-links.mjs --external",
+    "build": "tsc -p tsconfig.json",
+    "start": "node --enable-source-maps dist/main.js",
+    "dev": "tsx watch src/main.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "oxlint src test --deny-warnings --report-unused-disable-directives",
+    "check": "tsc --noEmit",
+    "check:test": "tsc -p tsconfig.test.json",
+    "verify": "npm run verify:sqlite && npm run lint && npm run check && npm run check:test && npm test && npm run build",
+    "migrate": "node dist/cli/commands.js migrate",
+    "backup": "node dist/cli/commands.js backup",
+    "integrity-check": "node dist/cli/commands.js integrity-check"
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "0.84.1",
+    "@earendil-works/pi-ai": "0.84.1",
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "@sinclair/typebox": "0.34.52",
+    "discord.js": "14.27.0",
+    "handlebars": "4.7.9",
+    "pino": "10.3.1",
+    "yaml": "2.9.0"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "oxlint": "1.80.0",
+    "tsx": "4.23.12",
+    "typescript": "7.0.2",
+    "vitest": "4.1.10"
+  }
+}

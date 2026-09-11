@@ -1,0 +1,18 @@
+# Local override (Section 39).
+#
+# The base `docker-compose.yml` only `expose`s port 3000 to sibling services; it
+# never publishes a port to the host. Copy this file to `docker-compose.override.yml`
+# to publish the HTTP `/status` and `/livez` endpoints on the host for local use:
+#
+#   cp docker-compose.override.example.yml docker-compose.override.yml
+#
+# The published port binds to loopback (127.0.0.1) only. The endpoints carry no
+# host-level authentication; put an authenticating proxy in front before you
+# publish them on any other interface.
+#
+# Docker Compose applies `docker-compose.override.yml` automatically on top of
+# the base file for `docker compose up`, so no `-f` flag is required.
+services:
+  cassandra:
+    ports:
+      - "127.0.0.1:3000:3000"

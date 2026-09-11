@@ -1,0 +1,35 @@
+# Dependencies
+node_modules/
+
+# Build / type-check output
+dist/
+build/
+site/
+*.tsbuildinfo
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# SQLite database and journals — never commit live memory data
+*.sqlite
+*.sqlite3
+*.db
+*.sqlite-shm
+*.sqlite-wal
+/data/
+/backups/
+/.experiment/
+
+# Logs
+*.log
+logs/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.idea/
+
+# Local Claude Code session state
+.claude/

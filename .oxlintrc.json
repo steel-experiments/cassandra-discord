@@ -1,0 +1,8 @@
+{
+  "rules": {
+    // Regression ceiling, not a quality target. The worst existing function
+    // scores 86 (applyOne). Ratchet this down as hotspots are simplified:
+    // 87 -> 60 -> 40 -> 25.
+    "complexity": ["error", { "max": 87 }]
+  }
+}

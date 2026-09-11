@@ -1,0 +1,23 @@
+.git
+.github
+node_modules
+dist
+coverage
+data
+backups
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+# Not part of the image. The Dockerfile copies package.json, package-lock.json,
+# tsconfig.json, src, migrations, prompts, docs, config, and docker/entrypoint.sh.
+test
+site
+contributor-docs
+plans
+internal
+mkdocs.yml
+requirements-docs.txt
+CASSANDRA_IMPLEMENTATION_SPEC.md
+*.md

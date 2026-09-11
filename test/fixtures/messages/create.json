@@ -1,0 +1,35 @@
+{
+  "id": "12345678901234567890",
+  "channel_id": "999999999999999999",
+  "guild_id": "888888888888888888",
+  "author": {
+    "id": "777777777777777777",
+    "username": "alice",
+    "global_name": "Alice",
+    "bot": false
+  },
+  "content": "We decided to ship the onboarding trial next week.",
+  "timestamp": "2024-05-01T12:00:00.000+00:00",
+  "edited_timestamp": null,
+  "type": 0,
+  "flags": 0,
+  "pinned": false,
+  "mention_everyone": false,
+  "mentions": [
+    { "id": "666666666666666666", "username": "bob", "global_name": "Bob" }
+  ],
+  "embeds": [{ "type": "link", "url": "https://example.com" }],
+  "components": [],
+  "attachments": [
+    {
+      "id": "555555555555555555",
+      "filename": "plan.txt",
+      "content_type": "text/plain",
+      "size": 1234,
+      "url": "https://cdn.example.com/plan.txt",
+      "proxy_url": "https://media.example.com/plan.txt"
+    }
+  ],
+  "message_reference": { "message_id": "444444444444444444", "channel_id": "999999999999999999" },
+  "poll": null
+}
