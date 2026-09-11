@@ -59,6 +59,17 @@ export interface BackupManifest {
   integrityCheck: 'ok';
 }
 
+/**
+ * Backup step size that copies the whole source in one step: its current page
+ * count, never below one. `sqlite3_backup_step(-1)` would do the same, but
+ * `node:sqlite` validates `rate` as a positive integer.
+ */
+function singleStepRate(source: DatabaseSync): number {
+  const row = source.prepare('PRAGMA page_count').get() as { page_count?: number } | undefined;
+  const pages = Number(row?.page_count ?? 0);
+  return Number.isInteger(pages) && pages > 0 ? pages : 1;
+}
+
 export interface CreateBackupOptions {
   /** The open application database connection (used to read the schema version). */
   db: DatabaseSync;
@@ -76,9 +87,10 @@ export interface CreateBackupOptions {
   /** Epoch milliseconds the backup is taken at (injectable for tests). */
   now: number;
   /**
-   * Pages copied per backup step. Default `-1`: all pages in one step, so a
-   * write from another connection cannot restart the copy between steps.
-   * Positive values yield finer progress callbacks.
+   * Pages copied per backup step. Default: the source page count, so the copy
+   * completes in one step and a write from another connection cannot restart
+   * it between steps. Must be a positive integer; `node:sqlite` rejects zero
+   * and negative values. Smaller values yield finer progress callbacks.
    */
   rate?: number;
   /** Optional progress callback, invoked after each step with page counts. */
@@ -210,7 +222,7 @@ export async function createBackup(options: CreateBackupOptions): Promise<Create
   try {
     source.enableLoadExtension(false);
     pages = await backup(source, backupPath, {
-      rate: options.rate ?? -1,
+      rate: options.rate ?? singleStepRate(source),
       progress: options.onProgress,
     });
 

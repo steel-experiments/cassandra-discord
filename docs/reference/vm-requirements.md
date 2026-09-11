@@ -17,7 +17,7 @@ figures below are starting points, not enforced limits.
 - enough shutdown time for Cassandra to drain work and checkpoint SQLite
 - separate off-host storage for backups
 
-The supplied image is based on `node:24-bookworm-slim`. The upstream Node image
+The supplied image is based on `node:24.21-bookworm-slim`. The tag pins the Node minor version, so a rebuild on another day gets the same `node:sqlite` behavior. The upstream Node image
 supports AMD64 and ARM64, among other Linux architectures.
 
 Use SSD-backed storage for `/app/data`. Cassandra uses SQLite in WAL mode and

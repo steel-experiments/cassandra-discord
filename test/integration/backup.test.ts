@@ -181,6 +181,26 @@ describe('online SQLite backup', { timeout: 15_000 }, () => {
     expect(integrityCheck(backupPath)).toBe('ok');
   });
 
+  it('copies the whole source in one step by default with a positive page rate', async () => {
+    // Enough rows to span many pages: the default rate must still finish the
+    // copy in one step, and node:sqlite accepts only positive integer rates.
+    for (let i = 0; i < 300; i++) addMessage(`seed-${i}`, `seed row ${i}`, 1_700_000_000_000 + i);
+    const steps: Array<{ totalPages: number; remainingPages: number }> = [];
+    const { backupPath } = await createBackup({
+      db: env.db,
+      backupsDir,
+      sourceDatabasePath: env.path,
+      appVersion: '1.0.0',
+      now: 1_700_010_000_000,
+      onProgress: (info) => steps.push(info),
+    });
+    // The progress callback runs between steps only, so a one-step copy
+    // reports no progress at all, while rate 1 on the same data reports many.
+    expect(steps).toEqual([]);
+    expect(backupCount(backupPath)).toBe(300);
+    expect(integrityCheck(backupPath)).toBe('ok');
+  });
+
   it('remains consistent when the same connection writes during the copy', async () => {
     // Seed enough rows to span several pages so rate:1 steps multiple times.
     for (let i = 0; i < 300; i++) addMessage(`seed-${i}`, `seed row ${i}`, 1_700_000_000_000 + i);

@@ -5248,7 +5248,7 @@ Recommended scripts:
 ### 38.1 `Dockerfile`
 
 ```dockerfile
-FROM node:24-bookworm-slim AS build
+FROM node:24.21-bookworm-slim AS build
 
 WORKDIR /app
 
@@ -5265,7 +5265,7 @@ COPY config ./config
 RUN npm run build \
     && npm prune --omit=dev
 
-FROM node:24-bookworm-slim AS runtime
+FROM node:24.21-bookworm-slim AS runtime
 
 ENV NODE_ENV=production \
     HOME=/tmp \

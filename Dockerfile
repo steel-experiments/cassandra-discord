@@ -4,7 +4,7 @@
 # and prunes dev dependencies; the runtime stage copies only what the application
 # needs and runs as the unprivileged `node` user under `tini` for proper PID 1 /
 # signal handling. Mutable state lives only under /app/data.
-FROM node:24-bookworm-slim AS build
+FROM node:24.21-bookworm-slim AS build
 
 WORKDIR /app
 
@@ -21,7 +21,7 @@ COPY config ./config
 RUN npm run build \
     && npm prune --omit=dev
 
-FROM node:24-bookworm-slim AS runtime
+FROM node:24.21-bookworm-slim AS runtime
 
 # Recorded source revision (Section 38.7). The release workflow passes the git
 # SHA of the tagged release. Empty in local builds; build-info treats an empty
