@@ -19,6 +19,9 @@ mode, the default, it never posts on its own.
 > linked). On 2026-08-20 a lower limit was proposed. I found no later
 > decision.
 
+Cassandra was inspired by Sunil Pai's essay
+[Every company needs a Cassandra](https://sunilpai.dev/posts/every-company-needs-a-cassandra/).
+
 Full documentation: <https://steel-experiments.github.io/cassandra-discord/>
 
 This file is written so that a person or a coding agent can install Cassandra
@@ -293,9 +296,6 @@ when code and spec disagree, the spec wins or the spec is amended. Migrations
 are immutable. Read [CONTRIBUTING.md](CONTRIBUTING.md),
 [SECURITY.md](SECURITY.md) for private vulnerability reports, and
 [the architecture map](contributor-docs/architecture.md).
-
-Cassandra was inspired by Sunil Pai's essay
-[Every company needs a Cassandra](https://sunilpai.dev/posts/every-company-needs-a-cassandra/).
 
 ## License
 
