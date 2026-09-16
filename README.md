@@ -1,5 +1,7 @@
 # Cassandra for Discord
 
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/template/cassandra-for-discord)
+
 Cassandra for Discord is a quiet organizational-memory agent for one Discord
 server. It ingests the channels you permit into SQLite, groups conversation
 into episodes, and extracts durable memories: decisions, assumptions,
