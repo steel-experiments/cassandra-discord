@@ -31,5 +31,6 @@ logs/
 Thumbs.db
 .idea/
 
-# Local Claude Code session state
+# Local tool state
 .claude/
+.railway/

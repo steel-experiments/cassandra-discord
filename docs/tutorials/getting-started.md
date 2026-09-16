@@ -231,7 +231,9 @@ record, but remains excluded from episodes and memories. This makes the
 channel useful for testing without teaching Cassandra from the tests.
 
 With `CHANNEL_POLICY_SOURCE=basic`, leave the console out of both selection
-lists: an unselected channel does not ingest. With a file policy, give the
+lists: an unselected channel does not ingest, and its visibility is also
+restricted, so ask the memory and catch-up questions from an org-visible
+channel. The console itself only confirms that Cassandra answers mentions. With a file policy, give the
 console an explicit rule. Replace the example ID with the Discord channel ID:
 
 ```yaml

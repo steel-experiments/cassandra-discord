@@ -200,9 +200,13 @@ Use `docker compose logs -f cassandra` or the terminal of a native run.
    @Cassandra what do you remember?
    ```
 
-   You get a direct reply, a bounded catch-up with inline source links, and
-   an inventory of permitted memories. "No matching permitted activity" is a
-   correct answer while nothing has been ingested yet.
+   `hi` gets a direct reply from the console. In basic mode, ask the two
+   content questions from an org channel such as `#general` instead: the
+   console is in neither list, so its scope is restricted, and answers there
+   report the memory count without repeating content. From the org channel
+   you get a bounded catch-up with inline source links and an inventory of
+   permitted memories. "No matching permitted activity" is a correct answer
+   while nothing has been ingested yet.
 5. With `FULL_HISTORY=true`, let the backfill drain before you judge memory
    coverage. `/cassandra status` shows the progress.
 6. Post a member notice before you treat the installation as live. A template
