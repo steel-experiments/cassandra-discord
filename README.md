@@ -38,6 +38,23 @@ should never pass through the agent's chat.
 Prefer to work through it yourself? Follow [Install Cassandra](docs/tutorials/getting-started.md)
 or the focused [Railway guide](docs/how-to/railway.md).
 
+## What Cassandra does
+
+Cassandra ingests the channels you select into SQLite, groups conversation into
+episodes, and extracts evidence-backed organizational memory. Mention it and it
+answers with links to permitted source messages. When it spots a contradiction
+or a forgotten decision, it can stay silent, propose an intervention for human
+review, or post within limits you control.
+
+![Cassandra recalls a migration risk with source links, then declines a question without permitted evidence.](assets/cassandra-example.png)
+
+It runs as one Node.js process with one SQLite database and one persistent data
+directory. There is no PostgreSQL, Redis, vector database, or message broker.
+The same image runs with Docker, on Railway, or on a single-VM Docker host.
+
+Cassandra was inspired by Sunil Pai's essay
+[Every company needs a Cassandra](https://sunilpai.dev/posts/every-company-needs-a-cassandra/).
+
 ## Give your agents the team's memory
 
 Cassandra's MCP server lets a connected agent search Discord conversations,
@@ -62,23 +79,6 @@ Cassandra. MCP is optional and disabled by default. See
 [Connect MCP clients](docs/how-to/connect-mcp-clients.md) for setup and
 [the MCP reference](docs/reference/http-and-mcp.md) for available tools and access
 rules.
-
-## What Cassandra does
-
-Cassandra ingests the channels you select into SQLite, groups conversation into
-episodes, and extracts evidence-backed organizational memory. Mention it and it
-answers with links to permitted source messages. When it spots a contradiction
-or a forgotten decision, it can stay silent, propose an intervention for human
-review, or post within limits you control.
-
-![Cassandra recalls a migration risk with source links, then declines a question without permitted evidence.](assets/cassandra-example.png)
-
-It runs as one Node.js process with one SQLite database and one persistent data
-directory. There is no PostgreSQL, Redis, vector database, or message broker.
-The same image runs with Docker, on Railway, or on a single-VM Docker host.
-
-Cassandra was inspired by Sunil Pai's essay
-[Every company needs a Cassandra](https://sunilpai.dev/posts/every-company-needs-a-cassandra/).
 
 ## Know before you install
 
