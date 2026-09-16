@@ -79,9 +79,10 @@ the copy and export again.
 
 ### From Railway
 
-> **Verification status.** This drill is written from the Railway CLI
-> contract. It has not been run against a live Railway volume. Test it on a
-> disposable service before you depend on it.
+> The export drill ran against a live Railway service on 2026-09-16: the
+> online backup, the manifest checksum, the off-platform copy, and the decoded
+> file all matched. Run it on a disposable service when you rehearse a
+> restore.
 
 Install the Railway CLI and log in. Run the checksum and the copy through
 `railway ssh` against your service. The `railway ssh -- <command>` form may
@@ -174,11 +175,10 @@ project prefix is the directory name of your Compose file.
 
 ### Restore on Railway
 
-> **Verification status.** This drill is written from the Railway CLI
-> contract. It has not been run against a live Railway volume. Rehearse it on
-> a disposable service first. The `railway ssh -- <command>` form may mangle
-> quotes and pipes; run the commands interactively inside the ssh session, or
-> wrap them in `sh -c '...'`.
+> Rehearse a restore on a disposable service before you depend on it. The
+> `railway ssh -- <command>` form may mangle quotes and pipes; run the
+> commands interactively inside the ssh session, or wrap them in `sh -c
+> '...'`.
 
 The service must be stopped, but the volume must stay mounted. Point the
 service start command at a long sleep, so the container runs without

@@ -9,7 +9,7 @@ and this project adheres to
 This changelog starts at the launch baseline. Changes before that point are
 not recorded.
 
-## [Unreleased]
+## [1.0.0] - 2026-09-16
 
 This entry is the launch baseline. It becomes version 1.0.0 when the first
 release is published. The release date is set at launch.
@@ -56,4 +56,4 @@ release is published. The release date is set at launch.
   list must name an id. `file` loads a full YAML policy with per-channel,
   per-category, and per-thread rules, and supports live reload.
 
-[Unreleased]: https://github.com/steel-experiments/cassandra-discord/commits/main
+[1.0.0]: https://github.com/steel-experiments/cassandra-discord/releases/tag/v1.0.0
