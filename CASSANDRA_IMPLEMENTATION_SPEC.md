@@ -5474,6 +5474,7 @@ cassandra-discord/
 ├── package-lock.json
 ├── tsconfig.json
 ├── README.md
+├── AGENT_SETUP.md
 ├── CASSANDRA_IMPLEMENTATION_SPEC.md
 ├── scripts/
 │   └── verify-sqlite.mjs

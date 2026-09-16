@@ -133,11 +133,3 @@ checksum, and restore commands for a Railway volume, see
 Do not follow a floating `latest` tag for unattended upgrades. See
 [Deploy Cassandra](deploy.md) for the migration compatibility rules and the
 reasons.
-
-## Verification status
-
-The statements above describe the intended template contract. A live install
-from the published template has not been run yet. Until launch, treat this
-page as the plan, not as a verified procedure. The placeholder at the top is
-removed only after the template exists and a first install was checked
-against this page.
