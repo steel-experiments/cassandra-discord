@@ -42,13 +42,17 @@ intervention:
   channel_cooldown_minutes: 180
   global_daily_limit: 5
   max_message_characters: 1800
+  # Proactive speech requires a human trigger created within this many days.
+  attention_window_days: 7
 
 memory:
   minimum_confidence: 0.55
   minimum_importance: 0.60
   followup_horizon_days: 14
   followup_max_messages: 20
+  # Deprecated: parsed for compatibility, ignored by attention admission.
   scheduled_review_reminder_days: 7
+  # Deprecated: parsed for compatibility, ignored by attention admission.
   staleness_horizon_days: 45
   require_evidence: true
   review_predictions: true

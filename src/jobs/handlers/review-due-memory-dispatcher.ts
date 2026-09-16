@@ -1,7 +1,14 @@
+// ABOUTME: Host-only daily dispatcher for proactive attention cohorts: eligible
+// ABOUTME: unconsumed revisions for review, uncovered work for scoped registration.
 import { createHash } from 'node:crypto';
 import { transactionImmediate, type DatabaseSync } from '../../db/database.js';
 import { fingerprintExposedMemory } from '../../agent/run-context.js';
-import { selectDueMemoriesForDispatch } from '../../memory/due.js';
+import {
+  ensureSubjectForMember,
+  selectEligibleRevisions,
+  selectRegistrationCandidates,
+} from '../../memory/attention-repository.js';
+import { DEFAULT_ATTENTION_WINDOW_MS } from '../../memory/attention.js';
 import {
   resolveScheduledMemoryRoute,
   type ScheduledMemoryRoute,
@@ -22,14 +29,16 @@ export interface ScheduledDispatchReport {
   considered: number;
   enqueued: number;
   suppressed: number;
+  registrationCandidates: number;
+  registrationEnqueued: number;
 }
 
 export interface ReviewDueMemoryDispatcherDeps extends ScheduledRouteOptions {
   db: DatabaseSync;
   now?: () => number;
   logger?: Pick<Logger, 'info' | 'warn'>;
-  /** Staleness horizon in milliseconds; 0 or absent disables it (Section 12.4). */
-  stalenessHorizonMs?: number;
+  /** Proactive attention window in milliseconds (Section 12.7; default seven days). */
+  attentionWindowMs?: number;
 }
 
 interface RoutedSubject {
@@ -37,14 +46,17 @@ interface RoutedSubject {
   memoryFingerprint: string;
   route: ScheduledMemoryRoute;
   ordinal: number;
+  attentionRevisionId?: string;
+  attentionWindowFromMs?: number;
+  attentionWindowUntilMs?: number;
 }
 
 function cohortKey(payload: JobTypePayloadMap['review_due_memory_cohort']): string {
   const subjects = [...payload.subjects]
     .sort((a, b) => a.memoryId.localeCompare(b.memoryId))
-    .map((subject) => `${subject.memoryId}:${subject.memoryFingerprint}`);
+    .map((subject) => `${subject.memoryId}:${subject.memoryFingerprint}:${subject.attentionRevisionId ?? ''}`);
   return `scheduled-cohort:${createHash('sha256')
-    .update(JSON.stringify([payload.routeKind, payload.targetChannelId, subjects]))
+    .update(JSON.stringify([payload.routeKind, payload.targetChannelId, payload.mode ?? '', subjects]))
     .digest('hex')}`;
 }
 
@@ -54,16 +66,26 @@ function chunks<T>(items: readonly T[], size: number): T[][] {
   return out;
 }
 
-/** Host-only daily dispatcher. It performs no model or Discord I/O. */
+/**
+ * Host-only daily dispatcher. It performs no model or Discord I/O. Selection is
+ * driven by eligible, unconsumed attention revisions (Section 12.7),
+ * independent of `review_after_ms`: a memory need not have a model review date
+ * to have a new relevant human event, and no eligible revision means no
+ * notification cohort. Registration cohorts carry uncovered recent work and
+ * never post.
+ */
 export function createReviewDueMemoryDispatcherHandler(
   deps: ReviewDueMemoryDispatcherDeps,
 ): JobHandler<'review_due_memories'> & { dispatch(): ScheduledDispatchReport } {
   const dispatch = (): ScheduledDispatchReport => {
     const now = deps.now?.() ?? Date.now();
-    const candidates = selectDueMemoriesForDispatch(deps.db, {
+    const windowMs = deps.attentionWindowMs ?? DEFAULT_ATTENTION_WINDOW_MS;
+    const rejectedMemoryIds = new Set<string>();
+    const candidates = selectEligibleRevisions(deps.db, {
       now,
+      windowMs,
       limit: SCHEDULED_DISPATCH_SCAN_LIMIT,
-      stalenessHorizonMs: deps.stalenessHorizonMs,
+      onRejected: (memoryId) => { rejectedMemoryIds.add(memoryId); },
     });
     const routed: RoutedSubject[] = [];
     for (const [ordinal, candidate] of candidates.entries()) {
@@ -74,6 +96,9 @@ export function createReviewDueMemoryDispatcherHandler(
         memoryFingerprint,
         route: resolveScheduledMemoryRoute(deps.db, candidate.memoryId, deps),
         ordinal,
+        attentionRevisionId: candidate.revisionId,
+        attentionWindowFromMs: candidate.windowFromMs,
+        attentionWindowUntilMs: candidate.windowUntilMs,
       });
     }
 
@@ -89,7 +114,32 @@ export function createReviewDueMemoryDispatcherHandler(
       .flatMap((group) => chunks(group, SCHEDULED_COHORT_SUBJECT_LIMIT))
       .sort((a, b) => (a[0]?.ordinal ?? 0) - (b[0]?.ordinal ?? 0));
 
+    // Registration candidates: uncovered in-window human evidence on memories
+    // that have no revision yet, or whose subject still awaits its initial
+    // registration pass. A candidate date in source text is detected by the
+    // scoped registration run itself, never here.
+    const registrationCandidates = selectRegistrationCandidates(deps.db, {
+      guildId: deps.guildId,
+      now,
+      windowMs,
+      limit: SCHEDULED_DISPATCH_SCAN_LIMIT,
+    });
+    const registrationRouted: RoutedSubject[] = [];
+    for (const [ordinal, candidate] of registrationCandidates.entries()) {
+      const memoryFingerprint = fingerprintExposedMemory(deps.db, candidate.memoryId);
+      if (!memoryFingerprint) continue;
+      const route = resolveScheduledMemoryRoute(deps.db, candidate.memoryId, deps);
+      if (route.kind === 'suppress') continue;
+      registrationRouted.push({
+        memoryId: candidate.memoryId,
+        memoryFingerprint,
+        route,
+        ordinal,
+      });
+    }
+
     let enqueuedCount = 0;
+    let registrationEnqueuedCount = 0;
     const dispatchedMemoryIds = new Set<string>();
     transactionImmediate(deps.db, () => {
       deps.db.prepare(
@@ -105,7 +155,15 @@ export function createReviewDueMemoryDispatcherHandler(
         const payload: JobTypePayloadMap['review_due_memory_cohort'] = {
           routeKind: first.route.kind,
           targetChannelId: first.route.targetChannelId,
-          subjects: cohort.map(({ memoryId, memoryFingerprint }) => ({ memoryId, memoryFingerprint })),
+          mode: 'attention_review',
+          subjects: cohort.map(({ memoryId, memoryFingerprint, attentionRevisionId,
+            attentionWindowFromMs, attentionWindowUntilMs }) => ({
+            memoryId,
+            memoryFingerprint,
+            attentionRevisionId,
+            attentionWindowFromMs,
+            attentionWindowUntilMs,
+          })),
         };
         const queued = enqueue(deps.db, {
           type: 'review_due_memory_cohort',
@@ -124,6 +182,43 @@ export function createReviewDueMemoryDispatcherHandler(
           dispatchedMemoryIds.add(subject.memoryId);
         }
         enqueuedCount += 1;
+      }
+
+      for (const cohort of chunks(registrationRouted, SCHEDULED_COHORT_SUBJECT_LIMIT)) {
+        if (enqueuedCount + registrationEnqueuedCount >= SCHEDULED_DISPATCH_JOB_LIMIT) break;
+        const first = cohort[0];
+        if (!first || first.route.kind === 'suppress') continue;
+        // One memory can legitimately appear in both scans — an eligible
+        // revision plus other uncovered in-window evidence. The lease's
+        // primary key admits one owner per memory, so the attention_review
+        // cohort wins and the registration pass waits for a later tick.
+        if (dispatchedMemoryIds.has(first.memoryId)) continue;
+        // The subject identity is host-assigned; the registration run validates
+        // the actual commitment through the typed contract and never posts.
+        ensureSubjectForMember(deps.db, { guildId: deps.guildId, memoryId: first.memoryId, now });
+        const payload: JobTypePayloadMap['review_due_memory_cohort'] = {
+          routeKind: first.route.kind,
+          targetChannelId: first.route.targetChannelId,
+          mode: 'attention_registration',
+          subjects: cohort.map(({ memoryId, memoryFingerprint }) => ({ memoryId, memoryFingerprint })),
+        };
+        const queued = enqueue(deps.db, {
+          type: 'review_due_memory_cohort',
+          payload,
+          uniqueKey: cohortKey(payload),
+          now,
+        });
+        if (!queued.enqueued) continue;
+        const insertLease = deps.db.prepare(
+          `INSERT INTO scheduled_review_cohort_subject_leases
+             (memory_id, job_id, memory_fingerprint, created_at_ms)
+           VALUES (?, ?, ?, ?)`,
+        );
+        for (const subject of cohort) {
+          insertLease.run(subject.memoryId, queued.id, subject.memoryFingerprint, now);
+          dispatchedMemoryIds.add(subject.memoryId);
+        }
+        registrationEnqueuedCount += 1;
       }
 
       const upsert = deps.db.prepare(
@@ -151,12 +246,23 @@ export function createReviewDueMemoryDispatcherHandler(
           now,
         );
       }
+      // Invalid source versions and events consumed by another subject still
+      // used a scan slot. Advance them so they cannot fill the first page on
+      // every tick and starve later current work.
+      for (const memoryId of rejectedMemoryIds) {
+        if (routed.some((subject) => subject.memoryId === memoryId)) continue;
+        const fingerprint = fingerprintExposedMemory(deps.db, memoryId);
+        if (!fingerprint) continue;
+        upsert.run(memoryId, fingerprint, null, 'suppress', now, null, now);
+      }
     });
 
     const report = {
-      considered: routed.length,
+      considered: routed.length + rejectedMemoryIds.size,
       enqueued: enqueuedCount,
-      suppressed: routed.filter((subject) => subject.route.kind === 'suppress').length,
+      suppressed: routed.filter((subject) => subject.route.kind === 'suppress').length + rejectedMemoryIds.size,
+      registrationCandidates: registrationRouted.length,
+      registrationEnqueued: registrationEnqueuedCount,
     };
     deps.logger?.info({ event: 'scheduled_review.dispatched', ...report }, 'scheduled review dispatch completed');
     return report;

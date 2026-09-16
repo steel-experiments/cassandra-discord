@@ -17,6 +17,16 @@ Make follow-up questions self-contained when possible. Cassandra can use permitt
 conversation and memories, but she does not treat every earlier chat message as an
 unbounded conversation history.
 
+## Why Cassandra rarely speaks first
+
+Cassandra sends an unsolicited message only when current work deserves it: a human
+message from the last seven days made a new commitment, changed a decision, reopened a
+question, reported a specific outcome, or contradicted something Cassandra remembers —
+or a human-stated deadline became due. Each such development earns one reminder at
+most, whatever happens to it. Silence does not delete or invalidate anything: the
+memory stays searchable, and an explicit question about older material always works
+the same way.
+
 ## Choose the right kind of answer
 
 | Need | Ask for |

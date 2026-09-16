@@ -1,5 +1,6 @@
 import { type DatabaseSync, transaction } from '../db/database.js';
 import { prepareCached } from '../db/repositories/util.js';
+import { purgeAttentionForMessage } from './attention-repository.js';
 import { deleteMessage, recordMessageTombstone } from '../db/repositories/messages.js';
 import {
   markAttachmentsDeleted,
@@ -189,6 +190,11 @@ export function forgetMessage(db: DatabaseSync, input: ForgetMessageInput): Forg
         'forget.dependent_memories',
         'SELECT DISTINCT memory_id FROM memory_evidence WHERE message_id = ?',
       ).all(input.messageId) as Array<{ memory_id: string }>;
+
+      // Purge source-linked proactive-attention evidence for the forgotten
+      // message. Revisions left without trigger evidence are invalidated and
+      // their claims stand, so the evidence cannot return as fresh.
+      purgeAttentionForMessage(db, input.messageId, input.nowMs);
 
       for (const { memory_id } of memoryIds) {
         const memory = readMemory(db, memory_id);

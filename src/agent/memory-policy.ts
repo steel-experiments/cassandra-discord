@@ -1,8 +1,9 @@
-import { type DatabaseSync } from '../db/database.js';
+import { transactionImmediate, type DatabaseSync } from '../db/database.js';
 import { prepareCached } from '../db/repositories/util.js';
 import { getUser } from '../db/repositories/users.js';
 import type { RetrievalGrant } from '../db/repositories/message-search.js';
-import { getChannel } from '../db/repositories/channels.js';
+import { getChannel, resolveRetrievableChannelScope } from '../db/repositories/channels.js';
+import { getMessage } from '../db/repositories/messages.js';
 import { getMemoryDetails } from '../memory/search.js';
 import {
   createMemory,
@@ -17,6 +18,41 @@ import {
   type MemoryEvidenceInput,
   type MemoryType,
 } from '../memory/repository.js';
+import {
+  DEFAULT_ATTENTION_WINDOW_MS,
+  findQuoteOffset,
+  isNewerThanFrontier,
+  sourceContentDigest,
+  type AttentionRejectionReason,
+} from '../memory/attention.js';
+import {
+  attachSubjectMember,
+  ensureSubjectForMember,
+  findConsumedTriggerMessageIds,
+  findSubjectForMember,
+  getClaim,
+  getRevision,
+  getSubjectConsumedFrontier,
+  listRevisionTriggerMessageIds,
+  listSubjectRevisions,
+  registerRevision,
+  setRevisionDeadline,
+  validateTriggerEvidence,
+  type TriggerEvidenceRecord,
+} from '../memory/attention-repository.js';
+import {
+  deadlineWindowIsRelevant,
+  deadlineExpressionIsBoundToQuote,
+  parseQuotedDeadline,
+  proposedAtAgrees,
+} from '../memory/deadline-evidence.js';
+import {
+  getDeadlineDecision,
+  getDeadlineForgetCutoff,
+  recordDeadlineDecision,
+  retireSubjectDeadlines,
+  type DeadlineDecision,
+} from '../memory/deadline-decisions.js';
 import type { Logger } from '../logger.js';
 import { findDuplicateCandidates } from '../memory/deduplicate.js';
 
@@ -74,6 +110,20 @@ export interface AgentMemoryProposal {
   ownerUserId?: string;
   reviewAt?: string;
   metadata?: Record<string, unknown>;
+  /** Optional material human development to register as attention (Section 12.7). */
+  attentionChange?: {
+    evidence: Array<{ messageId: string; quote: string }>;
+    relation: string;
+    materialChange: string;
+  };
+  /** Optional explicit human deadline authority to set or clear (Section 12.7). */
+  deadlineChange?: {
+    action: 'set' | 'clear';
+    sourceMessageId: string;
+    quote: string;
+    dateExpression?: string;
+    proposedAt?: string;
+  };
 }
 
 export type ProposalRejectionReason =
@@ -107,6 +157,21 @@ export interface ProposalOutcome {
   /** Human-readable detail for auditing (never includes message content). */
   detail?: string;
   evidenceMessageIds: string[];
+  /** Attention registration outcome when the proposal carried attentionChange. */
+  attention?: {
+    requested: true;
+    registered: boolean;
+    revisionId?: string;
+    reason?: AttentionRejectionReason;
+  };
+  /** Deadline authority outcome when the proposal carried deadlineChange. */
+  deadline?: {
+    requested: true;
+    applied: boolean;
+    revisionId?: string;
+    deadlineAtMs?: number;
+    reason?: AttentionRejectionReason;
+  };
 }
 
 export interface ApplyMemoryProposalsResult {
@@ -138,6 +203,12 @@ export interface ApplyMemoryProposalsDeps {
   minimumConfidence?: number;
   /** Host-configured importance floor for creates/supersedes (default 0). */
   minimumImportance?: number;
+  /** Proactive attention window (Section 12.7; default seven days). */
+  attentionWindowMs?: number;
+  /** Organization timezone captured with accepted deadline authority. */
+  attentionTimezone?: string;
+  /** Discord application id; Cassandra's own messages are never triggers. */
+  cassandraId?: string;
   logger?: Pick<Logger, 'info' | 'warn'>;
 }
 
@@ -215,6 +286,27 @@ export function applyMemoryProposals(
       ? reject({ index, action: proposal.action, accepted: false, evidenceMessageIds: proposal.evidenceMessageIds ?? [] },
         'duplicate_memory', `overlaps proposal ${overlap.index}; consolidate into one canonical memory or justify independence`)
       : applyOne(deps, proposal, index, evidenceMeta);
+    // Attention and deadline changes are processed only after the memory
+    // outcome resolves (including canonical duplicate-confirm and supersede),
+    // and their rejection never rolls back a valid memory mutation.
+    if (outcome.accepted && outcome.memoryId) {
+      if (proposal.attentionChange) {
+        outcome.attention = registerAttentionChange(deps, proposal.attentionChange, outcome.memoryId);
+      }
+      if (proposal.deadlineChange) {
+        outcome.deadline = applyDeadlineChange(deps, proposal.deadlineChange, outcome.memoryId);
+      }
+      // Subject identity is carried through supersession even when the
+      // proposal carries no attention fields: the successor joins the record
+      // it replaced so a waiting deadline revision keeps its dispatch path
+      // (Section 12.7).
+      if (proposal.action === 'supersede' && typeof proposal.existingMemoryId === 'string') {
+        const subjectId = findSubjectForMember(deps.db, proposal.existingMemoryId);
+        if (subjectId !== null) {
+          attachSubjectMember(deps.db, { subjectId, memoryId: outcome.memoryId, now: deps.now });
+        }
+      }
+    }
     if (outcome.accepted) applied.push(outcome);
     else rejected.push(outcome);
     if (outcome.accepted && (proposal.action === 'create' || proposal.action === 'supersede')) {
@@ -651,4 +743,279 @@ function findBatchOverlap(
     if (sharesEvidence) return { index };
   }
   return undefined;
+}
+
+// ---- Proactive attention registration (Section 12.7) ------------------------
+// These handlers run after the memory mutation committed. Every failure is a
+// content-free attention outcome; none of them can roll back the mutation.
+
+/**
+ * Register one material human development on the memory's subject. The trigger
+ * evidence must be run-exposed, human-authored, current, and inside the
+ * attention window; covered or frontier-old evidence never reopens a subject.
+ */
+function registerAttentionChange(
+  deps: ApplyMemoryProposalsDeps,
+  change: NonNullable<AgentMemoryProposal['attentionChange']>,
+  memoryId: string,
+): NonNullable<ProposalOutcome['attention']> {
+  try {
+    const evidence = Array.isArray(change.evidence)
+      ? change.evidence.filter((item): item is { messageId: string; quote: string } =>
+          typeof item?.messageId === 'string' && typeof item?.quote === 'string')
+      : [];
+    if (evidence.length === 0 || evidence.length > 3) {
+      return { requested: true, registered: false, reason: 'no_recent_human_trigger' };
+    }
+    for (const item of evidence) {
+      if (!deps.exposedMessageIds.has(item.messageId)) {
+        return { requested: true, registered: false, reason: 'trigger_changed' };
+      }
+    }
+    const validation = validateTriggerEvidence(deps.db, {
+      guildId: deps.guildId,
+      cassandraId: deps.cassandraId ?? '',
+      evidence,
+      now: deps.now,
+      windowMs: deps.attentionWindowMs ?? DEFAULT_ATTENTION_WINDOW_MS,
+    });
+    if (!validation.ok) {
+      return { requested: true, registered: false, reason: validation.reason };
+    }
+    const subjectId = ensureSubjectForMember(deps.db, {
+      guildId: deps.guildId, memoryId, now: deps.now,
+    });
+    const messageIds = validation.records.map((record) => record.messageId);
+    const covered = findConsumedTriggerMessageIds(deps.db, deps.guildId, messageIds);
+    const fresh = messageIds.filter((id) => !covered.has(id));
+    if (fresh.length === 0) {
+      return { requested: true, registered: false, reason: 'revision_consumed' };
+    }
+    const frontier = getSubjectConsumedFrontier(deps.db, subjectId);
+    const newest = validation.records.reduce((acc, record) =>
+      (record.createdAtMs > acc.createdAtMs ? record : acc));
+    if (!isNewerThanFrontier({ createdAtMs: newest.createdAtMs, messageId: newest.messageId }, frontier)) {
+      return { requested: true, registered: false, reason: 'revision_consumed' };
+    }
+    const { revisionId } = registerRevision(deps.db, {
+      subjectId,
+      triggers: validation.records.filter((record) => fresh.includes(record.messageId)),
+      now: deps.now,
+    });
+    return { requested: true, registered: true, revisionId };
+  } catch {
+    return { requested: true, registered: false, reason: 'trigger_changed' };
+  }
+}
+
+/**
+ * A deadline decision commits separately from its valid memory mutation. Its
+ * source frontier, revision changes and captured interpretation are atomic.
+ */
+function applyDeadlineChange(
+  deps: ApplyMemoryProposalsDeps,
+  change: NonNullable<AgentMemoryProposal['deadlineChange']>,
+  memoryId: string,
+): NonNullable<ProposalOutcome['deadline']> {
+  try {
+    const apply = () => applyDeadlineDecision(deps, change, memoryId);
+    return deps.db.isTransaction ? apply() : transactionImmediate(deps.db, apply);
+  } catch {
+    return { requested: true, applied: false, reason: 'deadline_unverified' };
+  }
+}
+
+function replayDeadlineDecision(
+  deps: ApplyMemoryProposalsDeps,
+  change: NonNullable<AgentMemoryProposal['deadlineChange']>,
+  source: TriggerEvidenceRecord,
+  decision: DeadlineDecision,
+): NonNullable<ProposalOutcome['deadline']> {
+  const reject = (reason: AttentionRejectionReason): NonNullable<ProposalOutcome['deadline']> =>
+    ({ requested: true, applied: false, reason });
+  if (decision.action !== change.action || decision.sourceCreatedAtMs !== source.createdAtMs
+    || decision.sourceContentDigest !== sourceContentDigest(source.content)) {
+    return reject('deadline_unverified');
+  }
+  if (decision.action === 'clear') return { requested: true, applied: true };
+
+  const expression = change.dateExpression?.trim() ?? '';
+  if (!deadlineExpressionIsBoundToQuote(source.content, source.quoteStart, source.quoteEnd, expression)
+    || (decision.expressionDigest !== null && decision.expressionDigest !== sourceContentDigest(expression))
+    || (decision.basis === 'legacy'
+      && (decision.quoteStart !== source.quoteStart || decision.quoteEnd !== source.quoteEnd))) {
+    return reject('deadline_unverified');
+  }
+  const revision = getRevision(deps.db, decision.revisionId);
+  if (!revision || revision.state !== 'current'
+    || revision.explicitDeadlineAtMs !== decision.deadlineAtMs
+    || revision.deadlineTimezone !== decision.timezone
+    || revision.deadlineParserVersion !== decision.parserVersion) {
+    return reject('trigger_changed');
+  }
+  if (getClaim(deps.db, decision.revisionId) !== null) return reject('revision_consumed');
+  if (change.proposedAt !== undefined) {
+    const proposed = Date.parse(change.proposedAt);
+    const agrees = decision.basis === 'legacy'
+      ? proposed === decision.deadlineAtMs
+      : proposedAtAgrees(proposed, {
+          dueAtMs: decision.deadlineAtMs, parserVersion: decision.parserVersion, basis: decision.basis,
+        }, decision.timezone);
+    if (!Number.isFinite(proposed) || !agrees) return reject('deadline_unverified');
+  }
+  // Do not run today's parser or timezone over an already accepted source.
+  // Equal-source re-extraction is a no-op even after configuration changes.
+  return {
+    requested: true, applied: true,
+    revisionId: decision.revisionId, deadlineAtMs: decision.deadlineAtMs,
+  };
+}
+
+function applyDeadlineDecision(
+  deps: ApplyMemoryProposalsDeps,
+  change: NonNullable<AgentMemoryProposal['deadlineChange']>,
+  memoryId: string,
+): NonNullable<ProposalOutcome['deadline']> {
+  const reject = (reason: AttentionRejectionReason): NonNullable<ProposalOutcome['deadline']> =>
+    ({ requested: true, applied: false, reason });
+  const source = resolveDeadlineSource(deps, change);
+  if ('reason' in source) return reject(source.reason);
+  const subjectId = ensureSubjectForMember(deps.db, { guildId: deps.guildId, memoryId, now: deps.now });
+  const forgottenAtMs = getDeadlineForgetCutoff(deps.db, subjectId);
+  if (forgottenAtMs !== null && source.record.createdAtMs <= forgottenAtMs) return reject('deadline_unverified');
+  const previous = getDeadlineDecision(deps.db, subjectId);
+  if (previous?.sourceMessageId === source.record.messageId) {
+    return replayDeadlineDecision(deps, change, source.record, previous);
+  }
+  if (previous !== null && !isNewerThanFrontier(
+    { createdAtMs: source.record.createdAtMs, messageId: source.record.messageId },
+    { createdAtMs: previous.sourceCreatedAtMs, messageId: previous.sourceMessageId },
+  )) return reject('deadline_unverified');
+
+  const decisionSource = {
+    subjectId,
+    sourceMessageId: source.record.messageId,
+    sourceCreatedAtMs: source.record.createdAtMs,
+    sourceContentDigest: sourceContentDigest(source.record.content),
+    quoteStart: source.record.quoteStart,
+    quoteEnd: source.record.quoteEnd,
+    recordedAtMs: deps.now,
+  };
+  if (change.action === 'clear') {
+    retireSubjectDeadlines(deps.db, subjectId, null);
+    if (!recordDeadlineDecision(deps.db, { ...decisionSource, action: 'clear' })) {
+      throw new Error('deadline decision source lost its ordering race');
+    }
+    return { requested: true, applied: true };
+  }
+  if (change.action !== 'set') return reject('deadline_unverified');
+
+  const expression = change.dateExpression?.trim() ?? '';
+  const timezone = deps.attentionTimezone ?? 'UTC';
+  const parsed = parseQuotedDeadline(expression, source.record, {
+    sourceAtMs: source.record.createdAtMs, timezone,
+  });
+  if (!parsed.ok) return reject('deadline_unverified');
+  if (change.proposedAt !== undefined) {
+    const proposed = Date.parse(change.proposedAt);
+    if (!Number.isFinite(proposed) || !proposedAtAgrees(proposed, parsed.deadline, timezone)) {
+      return reject('deadline_unverified');
+    }
+  }
+  if (!deadlineWindowIsRelevant(parsed.deadline, deps.now, deps.attentionWindowMs ?? DEFAULT_ATTENTION_WINDOW_MS)) {
+    return reject('attention_window_expired');
+  }
+  const covered = findConsumedTriggerMessageIds(deps.db, deps.guildId, [source.record.messageId]);
+  if (covered.has(source.record.messageId)) return reject('revision_consumed');
+  if (!isNewerThanFrontier(
+    { createdAtMs: source.record.createdAtMs, messageId: source.record.messageId },
+    getSubjectConsumedFrontier(deps.db, subjectId),
+  )) return reject('revision_consumed');
+
+  let target = listSubjectRevisions(deps.db, subjectId).find((revision) =>
+    revision.state === 'current' && getClaim(deps.db, revision.id) === null
+      && listRevisionTriggerMessageIds(deps.db, revision.id).includes(source.record.messageId));
+  if (!target) {
+    const registered = registerRevision(deps.db, { subjectId, triggers: [source.record], now: deps.now });
+    target = getRevision(deps.db, registered.revisionId) ?? undefined;
+  }
+  // Idempotent registration can return an old superseded/invalidated revision.
+  // Its old source never gets to invalidate the newer authority.
+  if (!target || target.state !== 'current') return reject('trigger_changed');
+  if (getClaim(deps.db, target.id) !== null) return reject('revision_consumed');
+
+  retireSubjectDeadlines(deps.db, subjectId, target.id);
+  setRevisionDeadline(deps.db, {
+    revisionId: target.id, deadlineAtMs: parsed.deadline.dueAtMs,
+    timezone, parserVersion: parsed.deadline.parserVersion, evidence: source.record,
+  });
+  if (!recordDeadlineDecision(deps.db, {
+    ...decisionSource, action: 'set', revisionId: target.id,
+    deadlineAtMs: parsed.deadline.dueAtMs, timezone, parserVersion: parsed.deadline.parserVersion,
+    basis: parsed.deadline.basis, expressionDigest: sourceContentDigest(expression),
+  })) throw new Error('deadline decision source lost its ordering race');
+  return {
+    requested: true, applied: true, revisionId: target.id, deadlineAtMs: parsed.deadline.dueAtMs,
+  };
+}
+
+/** Validate the deadline source message: run-exposed, current, human, verbatim quote. */
+function resolveDeadlineSource(
+  deps: ApplyMemoryProposalsDeps,
+  change: NonNullable<AgentMemoryProposal['deadlineChange']>,
+): { record: TriggerEvidenceRecord } | { reason: AttentionRejectionReason } {
+  if (typeof change.sourceMessageId !== 'string' || typeof change.quote !== 'string') {
+    return { reason: 'deadline_unverified' };
+  }
+  if (!deps.exposedMessageIds.has(change.sourceMessageId)) {
+    return { reason: 'trigger_changed' };
+  }
+  const validation = validateTriggerEvidenceWithoutWindow(deps, change.sourceMessageId, change.quote);
+  if (!validation.ok) return { reason: validation.reason };
+  return { record: validation.record };
+}
+
+/**
+ * Deadline evidence may be historical: the promise can predate the attention
+ * window while its verified deadline is still in the future. Only existence,
+ * guild, retrievability, human authorship, and quote fidelity are enforced.
+ */
+function validateTriggerEvidenceWithoutWindow(
+  deps: ApplyMemoryProposalsDeps,
+  messageId: string,
+  quote: string,
+): { ok: true; record: TriggerEvidenceRecord } | { ok: false; reason: AttentionRejectionReason } {
+  const message = getMessage(deps.db, messageId);
+  if (!message || message.deleted_at_ms !== null || message.guild_id !== deps.guildId) {
+    return { ok: false, reason: 'trigger_changed' };
+  }
+  if (!resolveRetrievableChannelScope(deps.db, message.channel_id)) {
+    return { ok: false, reason: 'trigger_changed' };
+  }
+  // Deadline evidence may be historical, but a future-dated source is never
+  // trustworthy (Section 12.7: future timestamps fail closed).
+  if (message.created_at_ms > deps.now) {
+    return { ok: false, reason: 'no_recent_human_trigger' };
+  }
+  const author = message.author_id === null
+    ? undefined
+    : prepareCached(deps.db, 'attention.author', 'SELECT is_bot FROM users WHERE id = ?')
+        .get(message.author_id) as { is_bot: number } | undefined;
+  if (!author || author.is_bot === 1 || message.author_id === deps.cassandraId) {
+    return { ok: false, reason: 'no_recent_human_trigger' };
+  }
+  const offset = findQuoteOffset(message.content, quote);
+  if (offset === null) {
+    return { ok: false, reason: 'trigger_changed' };
+  }
+  return {
+    ok: true,
+    record: {
+      messageId: message.id,
+      content: message.content,
+      createdAtMs: message.created_at_ms,
+      quoteStart: offset.start,
+      quoteEnd: offset.end,
+    },
+  };
 }

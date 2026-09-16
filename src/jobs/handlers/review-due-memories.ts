@@ -1,6 +1,6 @@
 import type { Api, Model, ThinkingLevel } from '@earendil-works/pi-ai';
 import type { StreamFn } from '@earendil-works/pi-agent-core';
-import { type DatabaseSync, transaction } from '../../db/database.js';
+import { type DatabaseSync, transaction, transactionImmediate } from '../../db/database.js';
 import {
   resolveRetrievableChannelScope,
   type VisibilityClass,
@@ -8,6 +8,20 @@ import {
 import { getMessage } from '../../db/repositories/messages.js';
 import type { RetrievalGrant } from '../../db/repositories/message-search.js';
 import { selectDueMemories, type DueMemoryCandidate } from '../../memory/due.js';
+import {
+  DEFAULT_ATTENTION_WINDOW_MS,
+  evaluateRevisionAdmission,
+} from '../../memory/attention.js';
+import {
+  claimRevision,
+  findSubjectForMember,
+  getClaim,
+  getRevision,
+  listRevisionTriggerMessageIds,
+  markSubjectRegistrationComplete,
+  revisionHasUnconsumedEvent,
+  validateRevisionEvidence,
+} from '../../memory/attention-repository.js';
 import { insertProposal } from '../../db/repositories/proposals.js';
 import { sanitizeOutboundMessage } from '../../discord/message-safety.js';
 import { isCassandraTestSurface } from '../../discord/test-channels.js';
@@ -107,7 +121,11 @@ export interface ScheduledReviewTarget {
 
 /** Complete task/system render context owned by the scheduled-review host. */
 export type ScheduledReviewRenderContext = {
-  dueMemories: Array<Omit<DueMemoryCandidate, 'memoryId'> & { id: string }>;
+  dueMemories: Array<Omit<DueMemoryCandidate, 'memoryId'> & {
+    id: string;
+    /** Host-pinned attention revision the notification must echo (Section 12.7). */
+    attentionRevisionId?: string;
+  }>;
   target: ScheduledReviewTarget;
   runtime: { mode: AutonomyMode; nowIso: string };
 };
@@ -126,6 +144,8 @@ export interface ScheduledNotificationProposal {
   message?: string;
   evidenceMessageIds: string[];
   subjectMemoryIds: string[];
+  /** Echo of the cohort's host-pinned attention revision (Section 12.7). */
+  attentionRevisionId?: string;
 }
 
 export interface ReviewDueMemoriesHandlerDeps {
@@ -166,6 +186,20 @@ export interface ReviewDueMemoriesHandlerDeps {
   memoryMinimumImportance?: number;
   /** Quiet period for an unchanged subject after send/dismissal (default 7 days). */
   scheduledReminderIntervalMs?: number;
+  /** Cohort attention mode (Section 12.7). Registration runs never post. */
+  attentionMode?: 'attention_review' | 'attention_registration';
+  /** Pinned attention revisions by subject memory (attention_review cohorts). */
+  attentionRevisions?: ReadonlyMap<string, {
+    revisionId: string;
+    windowFromMs: number;
+    windowUntilMs: number;
+  }>;
+  /** Proactive attention window (Section 12.7; default seven days). */
+  attentionWindowMs?: number;
+  /** Organization timezone captured with accepted deadline authority. */
+  attentionTimezone?: string;
+  /** Discord application id; Cassandra's own messages are never triggers. */
+  cassandraId?: string;
   logger?: Pick<Logger, 'info' | 'warn'>;
 }
 
@@ -180,6 +214,9 @@ export interface ApplyArgs {
   exposedMemoryIds: ReadonlySet<string>;
   minimumConfidence?: number;
   minimumImportance?: number;
+  attentionWindowMs?: number;
+  attentionTimezone?: string;
+  cassandraId?: string;
   logger?: Pick<Logger, 'info' | 'warn'>;
 }
 
@@ -281,6 +318,7 @@ function prepareScheduledNotification(
   provenance: AgentRunResult['provenance'],
   dueMemoryIds: ReadonlySet<string>,
   now: number,
+  pinnedAttention?: { revisionId: string; triggerMessageIds: readonly string[] },
 ): PreparedScheduledNotification {
   const blockingReasons: string[] = [];
   const recommendationReason = typeof notification?.reason === 'string'
@@ -288,6 +326,20 @@ function prepareScheduledNotification(
     : '';
   if (notification?.recommend === true && recommendationReason.length === 0) {
     blockingReasons.push('notification has no recommendation reason');
+  }
+  // The model must echo the host-pinned revision and cite its triggering
+  // evidence; historical context citations do not count as the trigger.
+  if (notification?.recommend === true && pinnedAttention) {
+    if (notification.attentionRevisionId !== pinnedAttention.revisionId) {
+      blockingReasons.push('notification did not echo the pinned attention revision');
+    } else {
+      const cited = new Set(
+        Array.isArray(notification.evidenceMessageIds) ? notification.evidenceMessageIds : [],
+      );
+      if (!pinnedAttention.triggerMessageIds.some((id) => cited.has(id))) {
+        blockingReasons.push('notification does not cite the pinned revision trigger');
+      }
+    }
   }
 
   const rawEvidenceIds = Array.isArray(notification?.evidenceMessageIds)
@@ -384,6 +436,9 @@ function prepareScheduledNotification(
           : [],
         citedMessageIds: new Set(evidenceMessageIds),
         now,
+        ...(pinnedAttention !== undefined
+          ? { acceptedTriggerMessageIds: new Set(pinnedAttention.triggerMessageIds) }
+          : {}),
       });
   if (notification?.recommend === true) {
     blockingReasons.push(...resolvedSubjects.blockingReasons);
@@ -397,6 +452,51 @@ function prepareScheduledNotification(
     blockingReasons: [...new Set(blockingReasons)],
     outboundSafety,
   };
+}
+
+/**
+ * Attention admission for the cohort's pinned revision (Section 12.7). Returns
+ * a content-free blocking reason when the pinned revision is no longer
+ * eligible, or null when it authorizes speech (or the cohort is a registration
+ * pass, which cannot produce notifications at all).
+ */
+function evaluateCohortAttention(
+  deps: ReviewDueMemoriesHandlerDeps,
+  due: readonly DueMemoryCandidate[],
+  now: number,
+): string | null {
+  if (deps.attentionMode !== 'attention_review') return null;
+  const memoryId = due[0]?.memoryId;
+  const pinned = memoryId !== undefined ? deps.attentionRevisions?.get(memoryId) : undefined;
+  if (!pinned) {
+    return 'attention gate (attention_authority_missing): cohort has no pinned revision';
+  }
+  const revision = getRevision(deps.db, pinned.revisionId);
+  if (!revision) {
+    return 'attention gate (trigger_changed): the pinned revision is gone';
+  }
+  if (!validateRevisionEvidence(deps.db, pinned.revisionId, now)) {
+    return 'attention gate (trigger_changed): the pinned sources are no longer current';
+  }
+  if (!revisionHasUnconsumedEvent(deps.db, pinned.revisionId)) {
+    return 'attention gate (revision_consumed): the human event has already been used';
+  }
+  const verdict = evaluateRevisionAdmission(
+    {
+      revisionId: revision.id,
+      subjectId: revision.subjectId,
+      state: revision.state,
+      humanEventAtMs: revision.humanEventAtMs,
+      explicitDeadlineAtMs: revision.explicitDeadlineAtMs,
+    },
+    getClaim(deps.db, pinned.revisionId),
+    now,
+    deps.attentionWindowMs ?? DEFAULT_ATTENTION_WINDOW_MS,
+  );
+  if (!verdict.eligible) {
+    return `attention gate (${verdict.reason}): the pinned revision is not eligible`;
+  }
+  return null;
 }
 
 /** Build a `review_due_memories` handler. `runScheduledReview()` exposes the work. */
@@ -550,12 +650,25 @@ export function createReviewDueMemoriesHandler(
         exposedMemoryIds,
         minimumConfidence: deps.memoryMinimumConfidence,
         minimumImportance: deps.memoryMinimumImportance,
+        attentionWindowMs: deps.attentionWindowMs,
+        attentionTimezone: deps.attentionTimezone,
+        cassandraId: deps.cassandraId,
         logger: deps.logger,
       },
       memoryProposals,
     );
 
     // 2. Persist the notification proposal through normal policy. Never approved.
+    const pinnedSubjectMemoryId = due[0]?.memoryId;
+    const pinnedRevision = pinnedSubjectMemoryId !== undefined
+      ? deps.attentionRevisions?.get(pinnedSubjectMemoryId)
+      : undefined;
+    const pinnedAttention = pinnedRevision !== undefined
+      ? {
+          revisionId: pinnedRevision.revisionId,
+          triggerMessageIds: listRevisionTriggerMessageIds(db, pinnedRevision.revisionId),
+        }
+      : undefined;
     const preparedNotification = prepareScheduledNotification(
       db,
       deps.guildId,
@@ -563,6 +676,7 @@ export function createReviewDueMemoriesHandler(
       result.provenance,
       new Set(due.map((memory) => memory.memoryId)),
       now,
+      pinnedAttention,
     );
     const currentMode = typeof deps.mode === 'function' ? deps.mode() : deps.mode;
     const baseRouting = routeScheduledNotification({
@@ -581,8 +695,13 @@ export function createReviewDueMemoriesHandler(
             ?? DEFAULT_SCHEDULED_REMINDER_INTERVAL_MS,
         })
       : { blocked: false as const };
+    const attentionGate = evaluateCohortAttention(deps, due, now);
     const allBlockingReasons = [
       ...preparedNotification.blockingReasons,
+      ...(deps.attentionMode === 'attention_registration' && notification?.recommend === true
+        ? ['registration cohorts never produce notifications']
+        : []),
+      ...(attentionGate !== null ? [attentionGate] : []),
       ...(deps.validateNotificationSubjects
         && !deps.validateNotificationSubjects(preparedNotification.subjects)
         ? ['notification subjects no longer resolve to the host-pinned working channel']
@@ -610,26 +729,88 @@ export function createReviewDueMemoriesHandler(
       outboundSafety: preparedNotification.outboundSafety,
       subjectBlockingReasons: allBlockingReasons,
       reasons: routing.reasons,
+      attention: {
+        mode: deps.attentionMode ?? '',
+        pinned: pinnedRevision !== undefined,
+        eligible: attentionGate === null,
+        ...(pinnedRevision !== undefined ? { revisionId: pinnedRevision.revisionId } : {}),
+        windowFromMs: pinnedRevision?.windowFromMs ?? 0,
+        windowUntilMs: pinnedRevision?.windowUntilMs ?? 0,
+      },
     });
     let proposalId = '';
-    transaction(db, () => {
-      proposalId = insertProposal(db, {
-        runId: result.runId,
-        episodeId: null,
-        targetChannelId: pinnedTargetChannelId,
-        status: routing.state,
-        computedScore: notification?.recommend === true ? 1 : 0,
-        reason: routing.reasons,
-        policyDecision,
-        reviewReason: recommendationReason || null,
-        topicKey: preparedNotification.topicKey,
-        message: preparedNotification.message,
-        evidenceMessageIds: preparedNotification.evidenceMessageIds,
-        expiresAtMs: routing.state === 'pending_review' ? now + DEFAULT_SCHEDULED_PROPOSAL_WINDOW_MS : null,
-        now,
+    let claimLost = false;
+    // The proposal deadline is the earlier of the ordinary window and the
+    // immutable attention window end (Section 12.7).
+    const ordinaryProposalExpiry = now + DEFAULT_SCHEDULED_PROPOSAL_WINDOW_MS;
+    const attentionExpiry = pinnedRevision !== undefined ? pinnedRevision.windowUntilMs : undefined;
+    const proposalExpiry = attentionExpiry !== undefined
+      ? Math.min(ordinaryProposalExpiry, attentionExpiry)
+      : ordinaryProposalExpiry;
+    if (routing.state === 'pending_review') {
+      transactionImmediate(db, () => {
+        proposalId = insertProposal(db, {
+          runId: result.runId,
+          episodeId: null,
+          targetChannelId: pinnedTargetChannelId,
+          status: routing.state,
+          computedScore: notification?.recommend === true ? 1 : 0,
+          reason: routing.reasons,
+          policyDecision,
+          reviewReason: recommendationReason || null,
+          topicKey: preparedNotification.topicKey,
+          message: preparedNotification.message,
+          evidenceMessageIds: preparedNotification.evidenceMessageIds,
+          expiresAtMs: proposalExpiry,
+          now,
+        });
+        insertScheduledProposalSubjects(db, proposalId, preparedNotification.subjects, now);
+        // Claim the pinned revision atomically with the actionable proposal. A
+        // lost race downgrades this row to observed inside the same
+        // transaction; an observed proposal claims nothing.
+        if (pinnedRevision && !claimRevision(db, {
+          revisionId: pinnedRevision.revisionId,
+          proposalId,
+          consumedAtMs: now,
+          eligibleFromMs: pinnedRevision.windowFromMs,
+          eligibleUntilMs: pinnedRevision.windowUntilMs,
+        })) {
+          claimLost = true;
+          db.prepare(
+            `UPDATE proposals SET status = 'observed', updated_at_ms = ?,
+               reason = 'attention gate (revision_consumed): the revision was claimed concurrently'
+             WHERE id = ?`,
+          ).run(now, proposalId);
+        }
       });
-      insertScheduledProposalSubjects(db, proposalId, preparedNotification.subjects, now);
-    });
+    } else {
+      transaction(db, () => {
+        proposalId = insertProposal(db, {
+          runId: result.runId,
+          episodeId: null,
+          targetChannelId: pinnedTargetChannelId,
+          status: routing.state,
+          computedScore: notification?.recommend === true ? 1 : 0,
+          reason: routing.reasons,
+          policyDecision,
+          reviewReason: recommendationReason || null,
+          topicKey: preparedNotification.topicKey,
+          message: preparedNotification.message,
+          evidenceMessageIds: preparedNotification.evidenceMessageIds,
+          expiresAtMs: null,
+          now,
+        });
+        insertScheduledProposalSubjects(db, proposalId, preparedNotification.subjects, now);
+      });
+    }
+    // A completed registration pass marks its subjects complete so the same
+    // uncovered evidence is not reconsidered each day.
+    if (deps.attentionMode === 'attention_registration') {
+      for (const memoryId of new Set(due.map((memory) => memory.memoryId))) {
+        const subjectId = findSubjectForMember(db, memoryId);
+        if (subjectId !== null) markSubjectRegistrationComplete(db, subjectId);
+      }
+    }
 
     deps.logger?.info(
       {
@@ -648,7 +829,17 @@ export function createReviewDueMemoriesHandler(
       runId: result.runId,
       dueCount: due.length,
       memory,
-      notification: { routing, proposalId },
+      // A lost claim race downgraded the durable row to observed inside the
+      // transaction; the outcome must agree so no card is posted for it.
+      notification: {
+        routing: claimLost
+          ? {
+              state: 'observed',
+              reasons: ['attention gate (revision_consumed): the revision was claimed concurrently'],
+            }
+          : routing,
+        proposalId,
+      },
       usage: result.usage,
     };
   };
@@ -679,6 +870,9 @@ function buildRenderContext(
       evidenceCount: d.evidenceCount,
       scopeType: d.scopeType,
       scopeKey: d.scopeKey,
+      ...(deps.attentionRevisions?.get(d.memoryId) !== undefined
+        ? { attentionRevisionId: deps.attentionRevisions.get(d.memoryId)!.revisionId }
+        : {}),
     })),
     target: scope.target,
     runtime: { mode: typeof deps.mode === 'function' ? deps.mode() : deps.mode, nowIso: new Date(now).toISOString() },

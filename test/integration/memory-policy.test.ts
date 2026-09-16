@@ -12,6 +12,8 @@ import {
   type AgentMemoryProposal,
   type ApplyMemoryProposalsDeps,
 } from '../../src/agent/memory-policy.js';
+import { claimRevision } from '../../src/memory/attention-repository.js';
+import { DEADLINE_PARSER_VERSION } from '../../src/memory/deadline-evidence.js';
 
 /**
  * Evidence and memory-proposal host validation (Sections 7, 12.2, 12.3, 23).
@@ -735,5 +737,326 @@ describe('applyMemoryProposals — memory quality hardening', () => {
     const out = applyMemoryProposals(makeDeps(new Set([CHANNEL])), [first, second]);
     expect(out.applied).toHaveLength(1);
     expect(out.rejected[0]?.reason).toBe('duplicate_memory');
+  });
+});
+
+describe('applyMemoryProposals — proactive attention registration — Section 12.7', () => {
+  function seedProposalRow(proposalId: string): void {
+    env.db.prepare(
+      `INSERT INTO agent_runs (id,guild_id,run_type,prompt_version,provider,model,status,started_at_ms)
+       VALUES (?, ?, 'episode', 'p', 'faux', 'faux', 'completed', ?)`,
+    ).run(`run-${proposalId}`, GUILD, NOW);
+    env.db.prepare(
+      `INSERT INTO proposals (id,run_id,target_channel_id,status,computed_score,reason,evidence_message_ids_json,created_at_ms,updated_at_ms)
+       VALUES (?, ?, ?, 'pending_review', 1, 'r', '[]', ?, ?)`,
+    ).run(proposalId, `run-${proposalId}`, CHANNEL, NOW, NOW);
+  }
+
+  it('registers a revision for a material human development on an accepted create', () => {
+    seedMessage('m1', CHANNEL, 'we changed the rollout decision this week');
+    const out = applyMemoryProposals(makeDeps(new Set([CHANNEL])), [
+      createProposal({
+        action: 'create',
+        statement: 'The rollout decision changed.',
+        evidenceMessageIds: ['m1'],
+        attentionChange: {
+          evidence: [{ messageId: 'm1', quote: 'changed the rollout decision' }],
+          relation: 'changed_decision',
+          materialChange: 'The rollout decision changed this week.',
+        },
+      }),
+    ]);
+    expect(out.applied).toHaveLength(1);
+    const attention = out.applied[0]!.attention;
+    expect(attention?.requested).toBe(true);
+    expect(attention?.registered).toBe(true);
+    expect(attention?.revisionId).toBeDefined();
+    const revision = env.db.prepare(
+      'SELECT state, human_event_at_ms FROM attention_revisions WHERE id = ?',
+    ).get(attention!.revisionId!) as { state: string; human_event_at_ms: number };
+    expect(revision.state).toBe('current');
+    expect(revision.human_event_at_ms).toBe(NOW);
+  });
+
+  it('keeps a valid memory mutation when attention registration is rejected', () => {
+    seedMessage('m1', CHANNEL, 'we changed the rollout decision this week');
+    seedMessage('m2', CHANNEL, 'an unexposed follow-up');
+    const deps = makeDeps(new Set([CHANNEL]));
+    // m2 exists but was never exposed to the run.
+    deps.exposedMessageIds.delete('m2');
+    const out = applyMemoryProposals(deps, [
+      createProposal({
+        action: 'create',
+        statement: 'The rollout decision changed.',
+        evidenceMessageIds: ['m1'],
+        attentionChange: {
+          evidence: [{ messageId: 'm2', quote: 'unexposed follow-up' }],
+          relation: 'changed_decision',
+          materialChange: 'Based on an unexposed message.',
+        },
+      }),
+    ]);
+    expect(out.applied).toHaveLength(1);
+    expect(out.applied[0]!.memoryId).toBeDefined();
+    expect(out.applied[0]!.attention?.registered).toBe(false);
+    expect(out.applied[0]!.attention?.reason).toBe('trigger_changed');
+    expect(env.db.prepare('SELECT COUNT(*) AS n FROM memories').get()).toEqual({ n: 1 });
+  });
+
+  it('cannot reuse consumed evidence for a second revision', () => {
+    seedMessage('m1', CHANNEL, 'we changed the rollout decision this week');
+    const deps = makeDeps(new Set([CHANNEL]));
+    const first = applyMemoryProposals(deps, [
+      createProposal({
+        action: 'create',
+        statement: 'The rollout decision changed.',
+        evidenceMessageIds: ['m1'],
+        attentionChange: {
+          evidence: [{ messageId: 'm1', quote: 'changed the rollout decision' }],
+          relation: 'changed_decision',
+          materialChange: 'First development.',
+        },
+      }),
+    ]);
+    const revisionId = first.applied[0]!.attention!.revisionId!;
+    seedProposalRow('prop-att-1');
+    expect(claimRevision(env.db, {
+      revisionId,
+      proposalId: 'prop-att-1',
+      consumedAtMs: NOW,
+      eligibleFromMs: NOW,
+      eligibleUntilMs: NOW + 7 * 86_400_000,
+    })).toBe(true);
+
+    const second = applyMemoryProposals(deps, [
+      createProposal({
+        action: 'create',
+        type: 'risk',
+        statement: 'A separate rollout risk statement.',
+        evidenceMessageIds: ['m1'],
+        independentReason: 'A distinct risk record that shares the source message.',
+        attentionChange: {
+          evidence: [{ messageId: 'm1', quote: 'changed the rollout decision' }],
+          relation: 'changed_decision',
+          materialChange: 'Replay of the same development.',
+        },
+      }),
+    ]);
+    // The memory side can still succeed; the attention replay cannot.
+    const attention = second.applied[0]?.attention ?? second.rejected[0]?.attention;
+    expect(attention?.registered).toBe(false);
+    expect(attention?.reason).toBe('revision_consumed');
+  });
+
+  it('sets and clears source-verified deadline authority beside a memory mutation', () => {
+    seedMessage('m1', CHANNEL, 'the report is promised by 18 September 2026');
+    const deps = { ...makeDeps(new Set([CHANNEL])), attentionTimezone: 'UTC' };
+    const set = applyMemoryProposals(deps, [
+      createProposal({
+        action: 'create',
+        statement: 'A report is promised.',
+        evidenceMessageIds: ['m1'],
+        deadlineChange: {
+          action: 'set',
+          sourceMessageId: 'm1',
+          quote: 'promised by 18 September 2026',
+          dateExpression: '18 September 2026',
+        },
+      }),
+    ]);
+    expect(set.applied[0]!.deadline?.applied).toBe(true);
+    const revisionId = set.applied[0]!.deadline!.revisionId!;
+    const row = env.db.prepare(
+      'SELECT explicit_deadline_at_ms, deadline_parser_version FROM attention_revisions WHERE id = ?',
+    ).get(revisionId) as { explicit_deadline_at_ms: number; deadline_parser_version: string };
+    expect(row.explicit_deadline_at_ms).toBe(Date.UTC(2026, 8, 18, 23, 59, 59, 999));
+    expect(row.deadline_parser_version).toBe(DEADLINE_PARSER_VERSION);
+
+    const memoryId = set.applied[0]!.memoryId!;
+    exposedMemoryIds.add(memoryId);
+    seedMessage('m2', CHANNEL, 'the report deadline is cancelled');
+    const cleared = applyMemoryProposals({ ...deps, exposedMessageIds: new Set(['m1', 'm2']) }, [
+      createProposal({
+        action: 'update',
+        existingMemoryId: memoryId,
+        statement: 'A report was promised; the deadline was cancelled.',
+        evidenceMessageIds: ['m1', 'm2'],
+        deadlineChange: {
+          action: 'clear',
+          sourceMessageId: 'm2',
+          quote: 'deadline is cancelled',
+        },
+      }),
+    ]);
+    expect(cleared.applied[0]!.deadline?.applied).toBe(true);
+    const after = env.db.prepare(
+      'SELECT explicit_deadline_at_ms FROM attention_revisions WHERE id = ?',
+    ).get(revisionId) as { explicit_deadline_at_ms: number | null };
+    expect(after.explicit_deadline_at_ms).toBeNull();
+  });
+
+  it('rejects a model-only date change while keeping the memory', () => {
+    seedMessage('m1', CHANNEL, 'the report is promised by 18 September 2026');
+    seedMessage('m2', CHANNEL, 'the report is promised by 30 September 2026');
+    const deps = { ...makeDeps(new Set([CHANNEL])), attentionTimezone: 'UTC' };
+    const out = applyMemoryProposals(deps, [
+      createProposal({
+        action: 'create',
+        statement: 'A report is promised.',
+        evidenceMessageIds: ['m1'],
+        deadlineChange: {
+          action: 'set',
+          sourceMessageId: 'm1',
+          quote: 'promised by 18 September 2026',
+          dateExpression: '30 September 2026', // not present in the cited source
+        },
+      }),
+    ]);
+    expect(out.applied).toHaveLength(1);
+    expect(out.applied[0]!.memoryId).toBeDefined();
+    expect(out.applied[0]!.deadline?.applied).toBe(false);
+    expect(out.applied[0]!.deadline?.reason).toBe('deadline_unverified');
+    expect(env.db.prepare('SELECT COUNT(*) AS n FROM attention_revisions').get()).toEqual({ n: 0 });
+  });
+});
+
+describe('applyMemoryProposals — deadline authority hardening — Section 12.7', () => {
+  it('rejects a deadline set grounded in already-consumed evidence', async () => {
+    seedMessage('m-consumed', CHANNEL, 'the audit is promised by 18 September 2026');
+    const deps = { ...makeDeps(new Set([CHANNEL])), attentionTimezone: 'UTC' };
+    const first = applyMemoryProposals(deps, [
+      createProposal({
+        action: 'create',
+        statement: 'An audit is promised.',
+        evidenceMessageIds: ['m-consumed'],
+        attentionChange: {
+          evidence: [{ messageId: 'm-consumed', quote: 'audit is promised' }],
+          relation: 'new_commitment',
+          materialChange: 'The audit commitment.',
+        },
+      }),
+    ]);
+    const revisionId = first.applied[0]!.attention!.revisionId!;
+    env.db.prepare(
+      `INSERT INTO agent_runs (id,guild_id,run_type,prompt_version,provider,model,status,started_at_ms)
+       VALUES ('run-consumed-1', ?, 'episode', 'p', 'faux', 'faux', 'completed', ?)`,
+    ).run(GUILD, NOW);
+    env.db.prepare(
+      `INSERT INTO proposals (id,run_id,target_channel_id,status,computed_score,reason,evidence_message_ids_json,created_at_ms,updated_at_ms)
+       VALUES ('p-consumed-1', 'run-consumed-1', ?, 'approved', 1, 'r', '[]', ?, ?)`,
+    ).run(CHANNEL, NOW, NOW);
+    const { claimRevision } = await import('../../src/memory/attention-repository.js');
+    expect(claimRevision(env.db, {
+      revisionId, proposalId: 'p-consumed-1', consumedAtMs: NOW,
+      eligibleFromMs: NOW, eligibleUntilMs: NOW + 7 * 86_400_000,
+    })).toBe(true);
+
+    // The same consumed message cannot reopen the subject as a deadline source.
+    exposedMemoryIds.add(first.applied[0]!.memoryId!);
+    const replay = applyMemoryProposals(deps, [
+      createProposal({
+        action: 'confirm',
+        existingMemoryId: first.applied[0]!.memoryId!,
+        statement: 'An audit is promised.',
+        evidenceMessageIds: ['m-consumed'],
+        deadlineChange: {
+          action: 'set',
+          sourceMessageId: 'm-consumed',
+          quote: 'audit is promised by 18 September 2026',
+          dateExpression: '18 September 2026',
+        },
+      }),
+    ]);
+    expect(replay.applied[0]!.accepted).toBe(true);
+    expect(replay.applied[0]!.deadline?.applied).toBe(false);
+    expect(replay.applied[0]!.deadline?.reason).toBe('revision_consumed');
+  });
+
+  it('rejects a bare weekday extracted from a qualified phrase', () => {
+    seedMessage('m-qualified', CHANNEL, 'lets target next Friday for the migration');
+    const deps = { ...makeDeps(new Set([CHANNEL])), attentionTimezone: 'UTC' };
+    const out = applyMemoryProposals(deps, [
+      createProposal({
+        action: 'create',
+        statement: 'The migration is scheduled.',
+        evidenceMessageIds: ['m-qualified'],
+        deadlineChange: {
+          action: 'set',
+          sourceMessageId: 'm-qualified',
+          quote: 'next Friday for the migration',
+          dateExpression: 'Friday',
+        },
+      }),
+    ]);
+    expect(out.applied[0]!.memoryId).toBeDefined();
+    expect(out.applied[0]!.deadline?.applied).toBe(false);
+    expect(out.applied[0]!.deadline?.reason).toBe('deadline_unverified');
+    expect(env.db.prepare('SELECT COUNT(*) AS n FROM attention_revisions').get()).toEqual({ n: 0 });
+  });
+
+  it('rejects conflicting date expressions inside the quoted commitment', () => {
+    seedMessage('m-conflicting', CHANNEL, 'ship either 18 September 2026 or 30 September 2026, not sure yet');
+    const deps = { ...makeDeps(new Set([CHANNEL])), attentionTimezone: 'UTC' };
+    const out = applyMemoryProposals(deps, [
+      createProposal({
+        action: 'create',
+        statement: 'The ship date is undecided.',
+        evidenceMessageIds: ['m-conflicting'],
+        deadlineChange: {
+          action: 'set',
+          sourceMessageId: 'm-conflicting',
+          quote: 'either 18 September 2026 or 30 September 2026',
+          dateExpression: '18 September 2026',
+        },
+      }),
+    ]);
+    expect(out.applied[0]!.deadline?.applied).toBe(false);
+    expect(out.applied[0]!.deadline?.reason).toBe('deadline_unverified');
+  });
+
+  it('a human reschedule supersedes the previous deadline authority', async () => {
+    seedMessage('m-schedule-1', CHANNEL, 'the report is promised by 18 September 2026');
+    const deps = { ...makeDeps(new Set([CHANNEL])), attentionTimezone: 'UTC' };
+    const first = applyMemoryProposals(deps, [
+      createProposal({
+        action: 'create',
+        statement: 'A report is promised.',
+        evidenceMessageIds: ['m-schedule-1'],
+        deadlineChange: {
+          action: 'set',
+          sourceMessageId: 'm-schedule-1',
+          quote: 'promised by 18 September 2026',
+          dateExpression: '18 September 2026',
+        },
+      }),
+    ]);
+    const memoryId = first.applied[0]!.memoryId!;
+    exposedMemoryIds.add(memoryId);
+    const firstRevision = first.applied[0]!.deadline!.revisionId!;
+
+    seedMessage('m-schedule-2', CHANNEL, 'the report moved: it is promised by 30 September 2026');
+    const rescheduledDeps = { ...makeDeps(new Set([CHANNEL])), attentionTimezone: 'UTC', now: NOW + 1000 };
+    rescheduledDeps.exposedMessageIds = new Set(['m-schedule-1', 'm-schedule-2']);
+    const rescheduled = applyMemoryProposals(rescheduledDeps, [
+      createProposal({
+        action: 'update',
+        existingMemoryId: memoryId,
+        statement: 'A report is promised at the end of September.',
+        evidenceMessageIds: ['m-schedule-1', 'm-schedule-2'],
+        deadlineChange: {
+          action: 'set',
+          sourceMessageId: 'm-schedule-2',
+          quote: 'promised by 30 September 2026',
+          dateExpression: '30 September 2026',
+        },
+      }),
+    ]);
+    expect(rescheduled.applied[0]!.deadline?.applied).toBe(true);
+    const newRevision = rescheduled.applied[0]!.deadline!.revisionId!;
+    expect(newRevision).not.toBe(firstRevision);
+    const { getRevision } = await import('../../src/memory/attention-repository.js');
+    expect(getRevision(env.db, firstRevision)?.state).toBe('superseded');
+    expect(getRevision(env.db, newRevision)?.explicitDeadlineAtMs)
+      .toBe(Date.UTC(2026, 8, 30, 23, 59, 59, 999));
   });
 });

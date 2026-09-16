@@ -10,6 +10,7 @@ describe('policy decision audit', () => {
       provenanceGate: { outcome: 'allow', reasons: [] }, outboundEvidence: { outcome: 'allow', reasons: [] },
       forcedReview: { forceReview: false, rules: [] }, cooldown: { allowed: true, blocks: [] },
       duplicate: { matched: true, similarity: .9, messagePreview: 'SECRET_PREVIEW' },
+      attention: { required: true, eligible: false, reason: 'revision_consumed', revisionId: 'rev-quiet', windowFromMs: 1, windowUntilMs: 2 },
       message: 'SECRET_MESSAGE', toolData: 'SECRET_TOOL',
     } as unknown as ProposalRoutingInput;
     const result = buildEpisodePolicyDecision(input, { state: 'observed', score: .748, reasons: ['disallowed mention'] } as ProposalRoutingResult, { outcome: 'reject', reasons: ['user mention'] });

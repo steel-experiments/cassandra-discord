@@ -240,6 +240,7 @@ describe('config', () => {
     expect(cfg.agent.name).toBe('Cassandra');
     expect(cfg.intervention.threshold).toBeCloseTo(0.78);
     expect(cfg.intervention.globalDailyLimit).toBe(5);
+    expect(cfg.intervention.attentionWindowDays).toBe(7);
     expect(cfg.memory.minimumConfidence).toBeCloseTo(0.55);
     expect(cfg.memory.minimumImportance).toBeCloseTo(0.6);
     expect(cfg.memory.followupHorizonDays).toBe(14);
@@ -266,6 +267,33 @@ describe('config', () => {
       { ...baseEnv(), MEMORY_SCHEDULED_REVIEW_REMINDER_DAYS: '0' },
       'MEMORY_SCHEDULED_REVIEW_REMINDER_DAYS',
     );
+  });
+
+  it('parses and validates the proactive attention window (Section 12.7)', () => {
+    // Default is 7 days when neither env nor YAML sets a value.
+    expect(loadConfig({ env: baseEnv() }).intervention.attentionWindowDays).toBe(7);
+    const cfg = loadConfig({
+      env: { ...baseEnv(), INTERVENTION_ATTENTION_WINDOW_DAYS: '14' },
+    });
+    expect(cfg.intervention.attentionWindowDays).toBe(14);
+    // The window is a positive integer; zero and negative values fail.
+    expectFail(
+      { ...baseEnv(), INTERVENTION_ATTENTION_WINDOW_DAYS: '0' },
+      'INTERVENTION_ATTENTION_WINDOW_DAYS',
+    );
+    expectFail(
+      { ...baseEnv(), INTERVENTION_ATTENTION_WINDOW_DAYS: '-7' },
+      'INTERVENTION_ATTENTION_WINDOW_DAYS',
+    );
+    expectFail(
+      { ...baseEnv(), INTERVENTION_ATTENTION_WINDOW_DAYS: '2.5' },
+      'INTERVENTION_ATTENTION_WINDOW_DAYS',
+    );
+    // The legacy reminder knob cannot disable the attention window and the
+    // window cannot be reinterpreted from the legacy knob.
+    expect(loadConfig({
+      env: { ...baseEnv(), MEMORY_SCHEDULED_REVIEW_REMINDER_DAYS: '1' },
+    }).intervention.attentionWindowDays).toBe(7);
   });
 
   it('parses and validates the staleness horizon', () => {

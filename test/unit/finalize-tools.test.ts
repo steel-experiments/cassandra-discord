@@ -152,6 +152,17 @@ describe('terminal finalization tools', () => {
     expect(srAccepted.details.kind).toBe('scheduled_review');
   });
 
+  it('accepts the optional attention revision echo on a scheduled notification', async () => {
+    const state = new RunFinalizationState(PINNED);
+    const tool = createFinalizeScheduledReviewTool(state);
+    const payload = scheduledReview(PINNED);
+    payload.notification.recommend = true;
+    payload.notification.attentionRevisionId = 'rev-pinned-1';
+    const res = await tool.execute('c1', payload);
+    expect(res.terminate).toBe(true);
+    expect(state.accepted?.kind).toBe('scheduled_review');
+  });
+
   it('applies an optional semantic validator through the one-correction gate', async () => {
     const state = new RunFinalizationState(PINNED);
     const tool = createFinalizeDirectAnswerTool(state, undefined, (proposal) =>

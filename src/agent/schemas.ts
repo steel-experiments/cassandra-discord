@@ -64,6 +64,63 @@ export const MemoryEvidenceQuote = strict({
   quote: Type.String({ minLength: 1, maxLength: 500 }),
 });
 
+// ---- Proactive attention (Section 12.7) ------------------------------------
+
+/** Relation a material human development has to its subject. */
+export const AttentionRelationEnum = Type.Union([
+  Type.Literal('new_commitment'),
+  Type.Literal('changed_decision'),
+  Type.Literal('explicit_reopening'),
+  Type.Literal('specific_outcome'),
+  Type.Literal('contradiction'),
+]);
+
+export const AttentionEvidenceItem = strict({
+  messageId: Id,
+  quote: Type.String({ minLength: 1, maxLength: 500 }),
+});
+
+/** A material human development offered as attention-changing evidence. */
+export const AttentionChange = strict({
+  evidence: Type.Array(AttentionEvidenceItem, { minItems: 1, maxItems: 3 }),
+  relation: AttentionRelationEnum,
+  materialChange: Type.String({ minLength: 1, maxLength: 500 }),
+});
+
+/** Explicit human-stated deadline authority: set or clear with exact quotes. */
+export const DeadlineChange = Type.Union([
+  strict({
+    action: Type.Literal('set'),
+    sourceMessageId: Id,
+    quote: Type.String({ minLength: 1, maxLength: 500 }),
+    dateExpression: Type.String({ minLength: 1, maxLength: 64 }),
+    proposedAt: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })),
+  }),
+  strict({
+    action: Type.Literal('clear'),
+    sourceMessageId: Id,
+    quote: Type.String({ minLength: 1, maxLength: 500 }),
+  }),
+]);
+
+/** Which durable memory an intervention speaks about. */
+export const InterventionSubject = Type.Union([
+  strict({ kind: Type.Literal('existing_memory'), memoryId: Id }),
+  strict({ kind: Type.Literal('memory_proposal'), proposalIndex: Type.Integer({ minimum: 0, maximum: 19 }) }),
+]);
+
+/** The current reason to speak: a fresh human development or a due deadline. */
+export const InterventionTrigger = Type.Union([
+  strict({
+    kind: Type.Literal('new_human_evidence'),
+    evidence: Type.Array(AttentionEvidenceItem, { minItems: 1, maxItems: 3 }),
+    relation: AttentionRelationEnum,
+    materialChange: Type.String({ minLength: 1, maxLength: 500 }),
+  }),
+  strict({ kind: Type.Literal('human_deadline'), revisionId: Id }),
+  strict({ kind: Type.Literal('none') }),
+]);
+
 export const MemoryDurabilityEnum = Type.Union([
   Type.Literal('transient'),
   Type.Literal('project'),
@@ -85,6 +142,8 @@ export const MemoryProposal = strict({
   ownerUserId: Type.Optional(Id),
   reviewAt: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })),
   metadata: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
+  attentionChange: Type.Optional(AttentionChange),
+  deadlineChange: Type.Optional(DeadlineChange),
 });
 
 export const InterventionProposal = strict({
@@ -97,6 +156,8 @@ export const InterventionProposal = strict({
   replyToMessageId: Type.Optional(Id),
   evidenceMessageIds: Type.Array(Id, { maxItems: 10 }),
   message: Type.Optional(Type.String({ maxLength: 1800 })),
+  subject: Type.Optional(InterventionSubject),
+  trigger: Type.Optional(InterventionTrigger),
 });
 
 export const FinalizeEpisodeReview = strict({
@@ -129,6 +190,8 @@ export const ScheduledNotification = strict({
   message: Type.Optional(Type.String({ maxLength: 1800 })),
   evidenceMessageIds: Type.Array(Id, { maxItems: 3 }),
   subjectMemoryIds: Type.Array(Id, { maxItems: 1 }),
+  /** Echo of the cohort's host-pinned attention revision (Section 12.7). */
+  attentionRevisionId: Type.Optional(Id),
 });
 
 export const FinalizeScheduledReview = strict({

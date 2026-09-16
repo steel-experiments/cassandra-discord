@@ -679,6 +679,16 @@ function renderPolicyDecision(value: Record<string, unknown> | null): string {
   const thresholds = object(value.thresholds), eligibility = object(value.eligibility);
   const safety = object(value.outboundSafety), provenance = object(value.provenanceGate);
   const evidence = object(value.outboundEvidence), subjects = object(value.subjectValidation);
+  const attention = object(value.attention);
+  const attentionText = [
+    attention.required === true || attention.pinned === true ? 'gated' : 'not required',
+    typeof attention.mode === 'string' && attention.mode.length > 0 ? `mode ${attention.mode}` : '',
+    typeof attention.reason === 'string' ? `reason ${attention.reason}` : '',
+    typeof attention.revisionId === 'string' ? `revision ${attention.revisionId.slice(0, 12)}` : '',
+    Number.isFinite(attention.windowUntilMs) && Number(attention.windowUntilMs) > 0
+      ? `window ends ${new Date(Number(attention.windowUntilMs)).toISOString()}`
+      : '',
+  ].filter((part) => part.length > 0).join(', ');
   const reasonText = (candidate: unknown): string => Array.isArray(candidate)
     ? candidate.slice(0, 32).filter((item): item is string => typeof item === 'string').map((item) => item.slice(0, 300)).join('; ')
     : '—';
@@ -691,6 +701,7 @@ ${tr('Outbound message safety', h(safety.outcome ?? '—'), h(reasonText(safety.
 ${tr('Retrieval provenance', h(provenance.outcome ?? '—'), h(reasonText(provenance.reasons)))}
 ${tr('Outbound evidence', h(evidence.outcome ?? '—'), h(reasonText(evidence.reasons)))}
 ${tr('Scheduled subjects', h(subjects.valid ?? '—'), h(reasonText(subjects.blockingReasons)))}
+${tr('Proactive attention', h(attention.eligible === false ? 'suppressed' : 'admitted'), h(attentionText || '—'))}
 </table>`;
 }
 

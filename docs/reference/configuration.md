@@ -242,18 +242,19 @@ has already blocked.
 | `CHANNEL_COOLDOWN_MINUTES` | `180` |
 | `GLOBAL_AUTONOMOUS_POST_LIMIT_PER_DAY` | `5` |
 | `CASSANDRA_MAX_MESSAGE_CHARACTERS` | `1800` |
+| `INTERVENTION_ATTENTION_WINDOW_DAYS` | `7` |
 | `MEMORY_MINIMUM_CONFIDENCE` | `0.55` |
 | `MEMORY_MINIMUM_IMPORTANCE` | `0.60` |
 | `MEMORY_FOLLOWUP_HORIZON_DAYS` | `14` |
 | `MEMORY_FOLLOWUP_MAX_MESSAGES` | `20` |
-| `MEMORY_SCHEDULED_REVIEW_REMINDER_DAYS` | `7` |
-| `MEMORY_STALENESS_HORIZON_DAYS` | `45` |
+| `MEMORY_SCHEDULED_REVIEW_REMINDER_DAYS` | `7` (deprecated) |
+| `MEMORY_STALENESS_HORIZON_DAYS` | `45` (deprecated) |
 | `MEMORY_REQUIRE_EVIDENCE` | `true` |
 | `MEMORY_REVIEW_PREDICTIONS` | `true` |
 | `MEMORY_REVIEW_ASSUMPTIONS` | `true` |
 
 Scores and confidence values must be between 0 and 1. Concurrency, episode,
-agent, intervention, memory-reminder, attachment-size, backup-interval, shutdown,
+agent, intervention, attention-window, attachment-size, backup-interval, shutdown,
 and MCP-limit settings must be positive. A zero reconciliation, thread-discovery,
 or optimize interval disables that timer.
 
@@ -265,16 +266,33 @@ model. Historical campaigns additionally cap look-ahead at their immutable end t
 This allows an answer or completion posted hours or days later to resolve an open
 question or commitment without turning the entire channel into one episode.
 
-`MEMORY_SCHEDULED_REVIEW_REMINDER_DAYS` sets the quiet period after Cassandra sends
-or an admin dismisses a reminder about an unchanged memory. A changed memory can become
-eligible immediately. This setting does not change the memory's semantic review date.
+`INTERVENTION_ATTENTION_WINDOW_DAYS` sets the proactive attention window. Cassandra
+proposes unsolicited speech only when a meaningful human message about the subject was
+created within this many days, or when an explicit human-stated deadline on an
+unconsumed subject revision becomes due. One material human development earns at most
+one speaking opportunity — a review card, a forced-review card, or an autonomous
+message — no matter how the earlier attempt ended. A new human development on the same
+subject creates a new opportunity. The window is separate from searchable memory: old
+memories stay available, and explicit questions about older material keep their
+existing behavior.
 
-`MEMORY_STALENESS_HORIZON_DAYS` sets the staleness horizon for scheduled review. When
-a memory's review date and its newest evidence message are both older than this many
-days, the host expires the memory silently instead of dispatching a review. The newest
-evidence message anchors on human activity, so extraction of an old conversation does
-not refresh it, while a reply or confirmation does. Each expiry writes an audit event.
-Set the value to `0` to disable the horizon.
+Deadlines must come from a known human's source message, with an exact quoted date
+and commitment. Accepted forms are `YYYY-MM-DD`, an ISO timestamp with an explicit
+offset, a full date such as `18 September 2026`, `today`, `tomorrow`, or an unqualified
+weekday. Relative dates use the source message's date, not the review date. Date-only
+deadlines fall at the end of the day in `ORG_TIMEZONE`; the accepted timezone
+and interpretation are retained. Ambiguous forms such as `03/04/2026` or `next Friday`
+do not authorize reminders. A newer human cancellation or reschedule replaces the
+earlier deadline; re-extracting older evidence cannot restore it.
+
+`MEMORY_SCHEDULED_REVIEW_REMINDER_DAYS` is deprecated. It is still parsed so existing
+configuration files load, but it no longer controls notification admission; repeated
+speech is bounded by attention consumption, not by a reminder interval.
+
+`MEMORY_STALENESS_HORIZON_DAYS` is deprecated. It is still parsed so existing
+configuration files load, but it no longer expires memories or blocks dispatch; closed
+attention opportunities expire on their own windows, and durable memories keep their
+semantic lifecycle states.
 
 ## Maintenance
 

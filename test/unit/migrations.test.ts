@@ -13,13 +13,15 @@ import {
   copyMigrationsToTemp,
   writeMigration,
   makeTempDir,
+  seedIdentity,
 } from '../helpers/db.js';
+import { getDeadlineDecision } from '../../src/memory/deadline-decisions.js';
 
 describe('migrations runner', () => {
   it('applies all migrations on first run', () => {
     const t = createTestDb();
     const applied = listAppliedMigrations(t.db);
-    expect(applied.map((m) => m.version)).toEqual(Array.from({ length: 37 }, (_, i) => i + 1));
+    expect(applied.map((m) => m.version)).toEqual(Array.from({ length: 39 }, (_, i) => i + 1));
     t.cleanup();
   });
 
@@ -27,7 +29,7 @@ describe('migrations runner', () => {
     const t = createTestDb();
     const result = applyMigrations(t.db, copyMigrationsToTemp());
     expect(result.applied).toHaveLength(0);
-    expect(listAppliedMigrations(t.db).map((m) => m.version)).toEqual(Array.from({ length: 37 }, (_, i) => i + 1));
+    expect(listAppliedMigrations(t.db).map((m) => m.version)).toEqual(Array.from({ length: 39 }, (_, i) => i + 1));
     t.cleanup();
   });
 
@@ -66,6 +68,8 @@ describe('migrations runner', () => {
       '035_episode_reasoning_shadow.sql',
       '036_agent_run_execution_start.sql',
       '037_ingestion_recovery.sql',
+      '038_proactive_attention.sql',
+      '039_deadline_decisions.sql',
     ]) rmSync(`${oldDir}/${name}`);
     const dbPath = `${oldDir}/upgrade.sqlite`;
     const db = openDatabase(dbPath);
@@ -77,7 +81,7 @@ describe('migrations runner', () => {
     db.prepare("INSERT INTO proposals (id,run_id,target_channel_id,status,computed_score,reason,evidence_message_ids_json,created_at_ms,updated_at_ms) VALUES ('proposal-upgrade','run-upgrade','c-upgrade','observed',0,'legacy','[]',1,1)").run();
 
     applyMigrations(db, copyMigrationsToTemp());
-    expect(listAppliedMigrations(db).map((m) => m.version)).toEqual(Array.from({ length: 37 }, (_, i) => i + 1));
+    expect(listAppliedMigrations(db).map((m) => m.version)).toEqual(Array.from({ length: 39 }, (_, i) => i + 1));
     expect(db.prepare("SELECT name FROM sqlite_master WHERE name='message_tombstones'").get()).toBeDefined();
     expect(db.prepare("SELECT name FROM sqlite_master WHERE name='attachment_file_purges'").get()).toBeDefined();
     const syncColumns = db.prepare('PRAGMA table_info(sync_cursors)').all() as Array<{ name: string }>;
@@ -185,6 +189,152 @@ describe('migrations runner', () => {
     t.cleanup();
   });
 
+  it('enforces migration 038 proactive-attention constraints', () => {
+    const t = createTestDb();
+    const g = "INSERT INTO guilds (id,name,discovered_at_ms,updated_at_ms) VALUES ('g-att','G',1,1)";
+    t.db.prepare(g).run();
+    t.db.prepare(`INSERT INTO channels
+      (id,guild_id,type,visibility_class,discovered_at_ms,updated_at_ms)
+      VALUES ('c-att','g-att',0,'org',1,1)`).run();
+    t.db.prepare(`INSERT INTO agent_runs
+      (id,guild_id,run_type,prompt_version,provider,model,status,started_at_ms)
+      VALUES ('run-att','g-att','episode','p','faux','faux','completed',1)`).run();
+    t.db.prepare(`INSERT INTO proposals
+      (id,run_id,target_channel_id,status,computed_score,reason,evidence_message_ids_json,created_at_ms,updated_at_ms)
+      VALUES ('p-att','run-att','c-att','pending_review',1,'r','[]',1,1)`).run();
+    t.db.prepare(`INSERT INTO users (id,is_bot,first_seen_at_ms,last_seen_at_ms)
+      VALUES ('u-att',0,1,1)`).run();
+    t.db.prepare(`INSERT INTO messages
+      (id,guild_id,channel_id,author_id,author_display_name,content,created_at_ms,ingested_at_ms,updated_at_ms)
+      VALUES ('m-att','g-att','c-att','u-att','A','body',1,1,1)`).run();
+    t.db.prepare(`INSERT INTO memories
+      (id,guild_id,scope_type,type,statement,confidence,importance,
+       first_seen_at_ms,last_confirmed_at_ms,created_at_ms,updated_at_ms)
+      VALUES ('mem-att','g-att','org','decision','We ship weekly.',0.9,0.8,1,1,1,1)`).run();
+
+    t.db.prepare(`INSERT INTO attention_subjects (id,guild_id,registration_state,created_at_ms)
+      VALUES ('s-att','g-att','pending',1)`).run();
+    expect(() => t.db.prepare(`INSERT INTO attention_subjects (id,guild_id,registration_state,created_at_ms)
+      VALUES ('s-bad','g-att','unknown',1)`).run()).toThrow();
+    t.db.prepare(`INSERT INTO attention_subject_members (memory_id,subject_id,created_at_ms)
+      VALUES ('mem-att','s-att',1)`).run();
+    // One memory belongs to at most one subject: the member PK blocks a second.
+    t.db.prepare(`INSERT INTO attention_subjects (id,guild_id,registration_state,created_at_ms)
+      VALUES ('s-two','g-att','pending',1)`).run();
+    expect(() => t.db.prepare(`INSERT INTO attention_subject_members (memory_id,subject_id,created_at_ms)
+      VALUES ('mem-att','s-two',1)`).run()).toThrow();
+    // The shared subject id is not unique on the members table, so it cannot
+    // parent another table's foreign key; revisions reference the subject row.
+    t.db.prepare(`INSERT INTO attention_revisions
+      (id,subject_id,revision_key,human_event_at_ms,state,created_at_ms)
+      VALUES ('r-att','s-att','key-a',10,'current',1)`).run();
+    expect(() => t.db.prepare(`INSERT INTO attention_revisions
+      (id,subject_id,revision_key,human_event_at_ms,state,created_at_ms)
+      VALUES ('r-dup','s-att','key-a',20,'current',1)`).run()).toThrow();
+    expect(() => t.db.prepare(`INSERT INTO attention_revisions
+      (id,subject_id,revision_key,human_event_at_ms,state,created_at_ms)
+      VALUES ('r-bad','s-att','key-b',10,'retired',1)`).run()).toThrow();
+    t.db.prepare(`INSERT INTO attention_revision_evidence
+      (revision_id,message_id,role,source_content_digest,quote_start,quote_end)
+      VALUES ('r-att','m-att','material_trigger','digest',0,4)`).run();
+    expect(() => t.db.prepare(`INSERT INTO attention_revision_evidence
+      (revision_id,message_id,role,source_content_digest,quote_start,quote_end)
+      VALUES ('r-att','m-att','origin','digest',0,4)`).run()).toThrow();
+    expect(() => t.db.prepare(`INSERT INTO attention_revision_evidence
+      (revision_id,message_id,role,source_content_digest,quote_start,quote_end)
+      VALUES ('r-att','m-att','material_trigger','digest',5,4)`).run()).toThrow();
+    t.db.prepare(`INSERT INTO proposal_attention_claims
+      (revision_id,proposal_id,consumed_at_ms,eligible_from_ms,eligible_until_ms)
+      VALUES ('r-att','p-att',30,10,40)`).run();
+    // One revision, one claim: the PK blocks a second claim even with no proposal.
+    expect(() => t.db.prepare(`INSERT INTO proposal_attention_claims
+      (revision_id,proposal_id,consumed_at_ms,eligible_from_ms,eligible_until_ms)
+      VALUES ('r-att',NULL,31,10,40)`).run()).toThrow();
+    // A proposal owns at most one revision.
+    t.db.prepare(`INSERT INTO attention_revisions
+      (id,subject_id,revision_key,human_event_at_ms,state,created_at_ms)
+      VALUES ('r-dup2','s-two','key-c',10,'current',1)`).run();
+    expect(() => t.db.prepare(`INSERT INTO proposal_attention_claims
+      (revision_id,proposal_id,consumed_at_ms,eligible_from_ms,eligible_until_ms)
+      VALUES ('r-dup2','p-att',31,10,40)`).run()).toThrow();
+    // Deleting the owning proposal must never make the revision reusable.
+    t.db.prepare('DELETE FROM proposals WHERE id = ?').run('p-att');
+    expect(t.db.prepare('SELECT revision_id, proposal_id FROM proposal_attention_claims')
+      .get()).toEqual({ revision_id: 'r-att', proposal_id: null });
+    t.cleanup();
+  });
+
+  it('upgrades version 38 deadline snapshots without reparsing or restoring cleared authority', () => {
+    const oldDir = copyMigrationsToTemp();
+    const newDir = copyMigrationsToTemp();
+    rmSync(`${oldDir}/039_deadline_decisions.sql`);
+    const db = openDatabase(`${oldDir}/deadline-upgrade.sqlite`);
+    try {
+      applyMigrations(db, oldDir);
+      const { guildId, channelId, userId } = seedIdentity(db);
+      for (const id of ['set-subject', 'clear-subject', 'ordinary-subject']) {
+        db.prepare(`INSERT INTO attention_subjects (id,guild_id,registration_state,created_at_ms)
+          VALUES (?,?,'complete',1)`).run(id, guildId);
+      }
+      const due = Date.parse('2026-09-18T21:59:59.999Z');
+      for (const [id, subject, sourceAt, deadline, recordedAt] of [
+        ['old', 'set-subject', 10, due - 86_400_000, 200],
+        ['new', 'set-subject', 20, due, 100],
+        ['cleared', 'clear-subject', 30, null, 300],
+        ['ordinary', 'ordinary-subject', 40, null, 400],
+      ] as const) {
+        db.prepare(`INSERT INTO messages
+          (id,guild_id,channel_id,author_id,author_display_name,content,created_at_ms,ingested_at_ms,updated_at_ms)
+          VALUES (?,?,?,?,?,'The report is due Friday.',?,?,?)`)
+          .run(id, guildId, channelId, userId, 'Alice', sourceAt, recordedAt, recordedAt);
+        db.prepare(`INSERT INTO attention_revisions
+          (id,subject_id,revision_key,human_event_at_ms,state,explicit_deadline_at_ms,
+           deadline_timezone,deadline_parser_version,created_at_ms)
+          VALUES (?,?,?,?,'current',?,?,?,?)`)
+          .run(id, subject, `key-${id}`, sourceAt, deadline,
+            deadline === null ? null : 'Europe/Zagreb', deadline === null ? null : 'deadline-v1', recordedAt);
+        db.prepare(`INSERT INTO attention_revision_evidence
+          (revision_id,message_id,role,source_content_digest,quote_start,quote_end)
+          VALUES (?,?,'material_trigger','source-digest',0,25)`).run(id, id);
+        if (id !== 'ordinary') db.prepare(`INSERT INTO attention_revision_evidence
+          (revision_id,message_id,role,source_content_digest,quote_start,quote_end)
+          VALUES (?,?,'explicit_deadline','source-digest',0,25)`).run(id, id);
+      }
+      db.prepare(`INSERT INTO proposal_attention_claims
+        (revision_id,proposal_id,consumed_at_ms,eligible_from_ms,eligible_until_ms)
+        VALUES ('cleared',NULL,31,30,40)`).run();
+
+      expect(applyMigrations(db, newDir).applied.map((m) => m.version)).toEqual([39]);
+      expect(getDeadlineDecision(db, 'set-subject')).toEqual({
+        subjectId: 'set-subject', sourceMessageId: 'new', sourceCreatedAtMs: 20,
+        sourceContentDigest: 'source-digest', quoteStart: 0, quoteEnd: 25,
+        recordedAtMs: 100, action: 'set', revisionId: 'new', deadlineAtMs: due,
+        timezone: 'Europe/Zagreb', parserVersion: 'deadline-v1', basis: 'legacy', expressionDigest: null,
+      });
+      expect(db.prepare(`SELECT explicit_deadline_at_ms,deadline_timezone,deadline_parser_version
+        FROM attention_revisions WHERE id='new'`).get()).toEqual({
+        explicit_deadline_at_ms: due, deadline_timezone: 'Europe/Zagreb', deadline_parser_version: 'deadline-v1',
+      });
+      expect(getDeadlineDecision(db, 'clear-subject')).toBeNull();
+      expect(db.prepare("SELECT state FROM attention_revisions WHERE id='cleared'").get())
+        .toEqual({ state: 'invalidated' });
+      expect(db.prepare("SELECT role FROM attention_revision_evidence WHERE revision_id='cleared'").all())
+        .toEqual([{ role: 'material_trigger' }]);
+      expect(db.prepare("SELECT revision_id FROM proposal_attention_claims WHERE revision_id='cleared'").get())
+        .toEqual({ revision_id: 'cleared' });
+      expect(db.prepare("SELECT state FROM attention_revisions WHERE id='ordinary'").get())
+        .toEqual({ state: 'current' });
+      expect(() => db.prepare("UPDATE attention_deadline_decisions SET deadline_basis=NULL").run()).toThrow();
+      expect(() => db.prepare("UPDATE attention_deadline_decisions SET action='clear'").run()).toThrow();
+      expect(db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
+      expect(applyMigrations(db, newDir).applied).toEqual([]);
+    } finally {
+      db.close();
+      rmSync(oldDir, { recursive: true, force: true });
+      rmSync(newDir, { recursive: true, force: true });
+    }
+  });
+
   it('upgrades version 18 recap rows into explicit retry lineages', () => {
     const v18Dir = copyMigrationsToTemp();
     rmSync(`${v18Dir}/019_deep_recap_retry_lineage.sql`);
@@ -206,6 +356,8 @@ describe('migrations runner', () => {
     rmSync(`${v18Dir}/035_episode_reasoning_shadow.sql`);
     rmSync(`${v18Dir}/036_agent_run_execution_start.sql`);
     rmSync(`${v18Dir}/037_ingestion_recovery.sql`);
+    rmSync(`${v18Dir}/038_proactive_attention.sql`);
+    rmSync(`${v18Dir}/039_deadline_decisions.sql`);
     const db = openDatabase(`${v18Dir}/lineage-upgrade.sqlite`);
     applyMigrations(db, v18Dir);
     db.prepare("INSERT INTO guilds (id,name,discovered_at_ms,updated_at_ms) VALUES ('g-lineage','G',1,1)").run();
@@ -270,6 +422,8 @@ describe('migrations runner', () => {
     rmSync(`${v19Dir}/035_episode_reasoning_shadow.sql`);
     rmSync(`${v19Dir}/036_agent_run_execution_start.sql`);
     rmSync(`${v19Dir}/037_ingestion_recovery.sql`);
+    rmSync(`${v19Dir}/038_proactive_attention.sql`);
+    rmSync(`${v19Dir}/039_deadline_decisions.sql`);
     const db = openDatabase(`${v19Dir}/cost-upgrade.sqlite`);
     applyMigrations(db, v19Dir);
     db.prepare("INSERT INTO guilds (id,name,discovered_at_ms,updated_at_ms) VALUES ('g-cost','G',1,1)").run();
@@ -311,10 +465,10 @@ describe('migrations runner', () => {
 
   it('rolls back a failed migration while keeping prior ones', () => {
     const dir = copyMigrationsToTemp();
-    writeMigration(dir, '038_bad.sql', 'CREATE TABLE definitely valid syntax NOT;');
+    writeMigration(dir, '040_bad.sql', 'CREATE TABLE definitely valid syntax NOT;');
     const db = openDatabase(`${dir}/db.sqlite`);
     expect(() => applyMigrations(db, dir)).toThrow();
-    expect(listAppliedMigrations(db).map((m) => m.version)).toEqual(Array.from({ length: 37 }, (_, i) => i + 1));
+    expect(listAppliedMigrations(db).map((m) => m.version)).toEqual(Array.from({ length: 39 }, (_, i) => i + 1));
     db.close();
   });
 

@@ -3,7 +3,7 @@ title: Cassandra for Discord — Final Implementation Specification
 status: Final v1 specification
 version: 1.4
 date: 2026-08-21
-last_amended: 2026-09-11
+last_amended: 2026-09-16
 target_runtime: Node.js container
 target_platforms:
   - Coolify on a single VM
@@ -1194,11 +1194,13 @@ A crash between the Discord call and the database update therefore results in on
 recovery lookup, not a duplicate post.
 
 For a proposal-backed scheduled notification, recovery and the worker repeat the current
-subject fingerprint, due-state, origin route, run provenance, evidence, and target-policy
-checks before a retry or Discord I/O. An unsent row whose route changed moves from
-`sending` to `cancelled`, its proposal becomes `expired`, and a durable review-card sync is
-queued. A Discord message already proven sent remains historical truth and is never
-cancelled or recreated.
+subject fingerprint, attention ownership and window (Section 12.7), origin route, run
+provenance, evidence, and target-policy checks before a retry or Discord I/O. An unsent
+row whose route changed, whose proposal no longer owns a valid revision claim, or
+whose attention window has closed moves from `sending` to `cancelled`, its proposal
+becomes `expired`, and a durable review-card sync is queued. A Discord message already
+proven sent remains historical truth and is never cancelled or recreated, even when the
+attention window later ended.
 
 ### 10.2 Channel-policy review-card recovery
 
@@ -1354,15 +1356,14 @@ Memory actions proposed by the agent:
 
 The host validates each mutation against evidence and existing-memory visibility.
 
-One transition is host-initiated and needs no new evidence: the staleness sweep in the
-periodic maintenance job sets a memory to `expired` when its review date and its newest
-evidence message are both older than the staleness horizon
-(`MEMORY_STALENESS_HORIZON_DAYS`, default `45`; `0` disables it). The newest evidence
-message is the human-activity anchor: a reply or an evidence-backed confirmation moves
-it, while extraction or re-extraction of an old conversation does not. The sweep skips
-memories leased to a queued or running scheduled-review cohort and writes one
-content-free `admin_events` row (`memory_staleness_expire`) per expiry. Re-running the
-sweep is a safe no-op.
+(Amendment (2026-09-16): the host never changes a durable memory's status because of age
+alone. `MEMORY_STALENESS_HORIZON_DAYS` and `MEMORY_SCHEDULED_REVIEW_REMINDER_DAYS` are
+deprecated: they remain parseable for backward compatibility but no longer control
+notification admission or memory status. What age retires is the opportunity to speak,
+not the memory: attention revisions whose supported windows have all closed are expired
+by the attention sweep (Section 12.7) with one content-free `admin_events` row
+(`attention_window_expire`) per revision. Silence about a subject does not mark the
+underlying work complete, invalidate the memory, or delete history.)
 
 ### 12.3 Evidence requirement
 
@@ -1421,44 +1422,49 @@ applicable, `allow_interventions=1`, a non-excluded non-Cassandra control surfac
 configured review audience that accepts the cohort's scopes. Unsafe but review-visible
 subjects receive `secure_maintenance`; unsafe-to-review subjects are suppressed.
 
-`review_due_memories` is a host-only bounded dispatcher. It never selects a memory past
-the staleness horizon; the maintenance sweep in Section 12.2 expires such memories
-silently instead. One pass considers at most 50 due
-memories in round-robin order using durable consideration state, creates at most eight new
+`review_due_memories` is a host-only bounded dispatcher. It selects eligible, unconsumed
+attention revisions (Section 12.7), independent of `review_after_ms`: a memory need not
+have a model review date to have a new relevant human event, and no eligible revision
+means no notification cohort. One pass considers at most 50 subjects in round-robin order
+using durable consideration state, including rows rejected for stale sources or consumed
+events so those rows cannot starve later work. It creates at most eight new
 `review_due_memory_cohort` jobs, and puts exactly one snapshot subject in each cohort, so
 every proposal and delivered notification covers one memory. Working cohorts route to the
 exact target derived from the subject's origin evidence. Secure-maintenance cohorts are pinned to the exact
 review-channel ID observed by the dispatcher and have notifications disabled. Per-memory
-cohort leases prevent overlapping queued or running cohorts. The child validates every
-fingerprint, due state, route, and configured review-channel identity before model exposure
-and repeats that validation for every exposed subject after the model returns, before any
-memory mutation or proposal persistence. Drift discards the entire cohort result; a
-completed broad run is never retargeted.
+cohort leases prevent overlapping queued or running cohorts. Cohort payloads carry the
+pinned attention revision identity and its immutable window, and the child validates every
+fingerprint, attention revision, route, and configured review-channel identity before
+model exposure and repeats that validation for every exposed subject after the model
+returns, before any memory mutation or proposal persistence. Drift discards the entire
+cohort result; a completed broad run is never retargeted. A cohort stays pinned to its
+original revision: a revision discovered during the run may update memory but cannot
+retarget that run's notification.
 
 The semantic review date and the notification cadence are separate. `review_after_ms`
 records when the underlying memory became due; creating, approving, dismissing, or sending
-a reminder must not change that date or imply that the memory was confirmed. Every
-recommended scheduled notification declares its subject in `subjectMemoryIds`. The host
-accepts only current due memories exposed to the run whose stored evidence overlaps the
-notification's validated citations. It records each accepted subject together with the
-current host-computed memory exposure fingerprint. The dispatcher creates single-subject
-cohorts, so a recommended notification declares exactly one subject; the host gate stays
-written over subject sets and remains correct for legacy multi-subject proposals.
+a reminder must not change that date or imply that the memory was confirmed, and a
+model-written `review_after_ms` never grants attention admission (Section 12.7). Every
+recommended scheduled notification declares its subject in `subjectMemoryIds` and echoes
+the cohort's pinned attention revision in `attentionRevisionId`. The host accepts only
+current subjects exposed to the run whose stored evidence overlaps the notification's
+validated citations, and only the pinned revision. It records each accepted subject
+together with the current host-computed memory exposure fingerprint. The dispatcher
+creates single-subject cohorts, so a recommended notification declares exactly one
+subject; the host gate stays written over subject sets and remains correct for legacy
+multi-subject proposals.
 
-Before creating an actionable card, the host checks prior scheduled proposals by
-overlapping subject memory, not by wording alone. An actionable earlier card whose
-overlapping subject fingerprint is still current suppresses the new card. An approved
-delivery that has not reached a terminal outbox state, including a queued or sending
-delivery, also suppresses it. A sent or dismissed proposal suppresses the same unchanged
-subject until `MEMORY_SCHEDULED_REVIEW_REMINDER_DAYS` elapses (default `7`), measured from
-the actual send or dismissal. A changed subject fingerprint does not inherit that
-subject-reminder interval, but any other overlapping unchanged subject can still block the
-proposal. A stale earlier card does not block a fresh proposal, and an approval attempt on
-the stale card expires it instead of sending old text. This eligibility applies to review
-card creation; the ordinary delivery gates in Section 24 still apply. The same subject
-check runs again while holding the approval transaction so two duplicate cards cannot
-both reserve delivery. A suppressed proposal is retained as `observed` with a content-free
-reason and is never delivered as a review card.
+(Amendment (2026-09-16): before creating an actionable card, the host admits the proposal
+through the attention gate in Section 12.7: the pinned revision must be current,
+unconsumed, and inside its window. The eligible revision is claimed in the same immediate
+transaction that persists the proposal, so concurrent attempts yield exactly one owner;
+observed proposals claim nothing. Security exposure fingerprints remain unchanged and are
+still validated at creation, approval, and delivery — a changed subject fingerprint still
+expires a stale card — but fingerprint equality no longer grants or resets a speaking
+opportunity, and no reminder interval does either. A suppressed proposal is retained as
+`observed` with a content-free reason and is never delivered as a review card. The same
+attention ownership check runs again while holding the approval transaction so two
+duplicate cards cannot both reserve delivery.)
 
 At process startup the scheduler resumes the daily review from its last recorded run
 (Section 10): a review whose last run is more than 24 hours old is enqueued shortly after
@@ -1496,6 +1502,128 @@ Search:
 5. memory importance.
 
 Embeddings may later be applied to episode summaries and memories, not every raw message.
+
+### 12.7 Proactive attention admission
+
+(Amendment (2026-09-16): Cassandra speaks proactively only about current work. This
+section governs permission to propose or deliver unsolicited speech — episode
+interventions and scheduled notifications. It does not limit historical ingestion,
+invalidate old decisions, or restrict answers to explicit questions about older
+material. Historical reconstruction never posts, as before.)
+
+**Attention window.** The default attention window is seven elapsed days
+(`INTERVENTION_ATTENTION_WINDOW_DAYS` / `intervention.attention_window_days`, default
+`7`, a positive integer; zero is invalid). A normal trigger is a meaningful human
+message originally created within `[now - window, now]`, measured by message creation
+time. Future timestamps fail closed. An edit to an old message may invalidate evidence
+or change memory, but does not become a new proactive trigger: `edited_at` and
+ingestion time never refresh attention.
+
+**Subjects and revisions.** A subject is a host-assigned stable issue identity carried
+through confirm, update, and supersession; durable memories are members of a subject,
+and deleting a member memory never deletes the subject, its revisions, or its
+consumption. A revision is one material human development of a subject, identified by a
+revision key derived from validated human event identities — the triggering message
+IDs — never from model prose, memory confidence, `reviewAt`, or security fingerprints.
+Reattaching identical evidence under another stance, a new memory UUID, supersession, or
+re-extraction cannot create a second revision of the same event. An older decision may
+support an intervention about a current contradiction, reopened question, changed
+commitment, or specific reported outcome; the recent trigger and the older supporting
+evidence are separate roles, and historical context citations never count as the
+trigger.
+
+**Consumption.** One revision earns at most one actionable proposal — a review card, a
+forced-review card, or an autonomous message. The claim is taken in the same immediate
+transaction that persists the proposal and its outbox row when approved, so concurrent
+attempts yield exactly one owner. Consumption survives approval, sending, dismissal,
+expiry, failure, restart, uncertain card delivery, and later deletion of the proposal
+row; a claim is retained when review-card I/O fails. An observed proposal claims
+nothing. Retrying the same proposal's legitimate delivery is always allowed. Passage of
+time, a missing completion record, a model-written `reviewAt`, a changed confidence or
+evidence stance, reactions, or a model decision to review an item again never create
+another opportunity.
+
+**Explicit deadlines.** An explicit human-stated deadline in exposed, known-human
+evidence may make an older, unconsumed revision eligible once when the deadline becomes
+due: its window is `[deadlineAt, deadlineAt + window]`. There is no repeated overdue
+escalation, and a revision already surfaced for a recent development cannot get a second
+notification because its deadline arrives. Deadline authority requires an exact date
+expression from the supported grammar and a verbatim quote in the source, agreement
+with the model-proposed timestamp when one is supplied, and a clear proposed commitment
+relation to the subject; the date must occur within the verified commitment quote,
+not elsewhere in its message. `reviewAt` is never deadline authority. The supported grammar
+(`deadline-evidence.ts`, parser version `deadline-v2`) is: a `YYYY-MM-DD` ISO date; an
+ISO timestamp with an explicit `Z`/`±HH:MM` offset; a full day/month/year form such as
+`18 September 2026` or `September 18, 2026`; and `today`, `tomorrow`, or an unqualified
+weekday resolved against the source message's local date (the first occurrence on or
+after it). Date-only forms fall due at the end of that local day in the organization
+timezone. Ambiguous numeric forms (`03/04/2026`), qualified weekdays (`next Friday`),
+`end of week`, missing-year month/day forms, multiple conflicting expressions, and
+impossible dates are rejected; the expression must stand alone in the source, so a bare
+weekday cannot be extracted from a qualified phrase. The organization
+timezone and parser version are captured when authority is accepted, so an old source
+is never silently reinterpreted after configuration changes. A human rescheduling or
+cancellation supersedes the previous authority, including an unsent claimed revision.
+The latest set or cancellation retains its human source order independently of claims;
+replaying older evidence cannot replace it. Equal-source re-extraction preserves the
+accepted instant, timezone, and parser version. Ending the ordinary message window does
+not retire an unconsumed revision whose verified deadline window is still in the
+future; an unconsumed opportunity is retired only after all its supported windows have
+closed and no future deadline remains.
+
+**Host validation.** The host validates trigger evidence exactly: each cited message
+must exist, be undeleted, be authored by a known human (never Cassandra or another
+bot), be currently visible in the run scope, carry a verbatim quote, and fall inside
+the window by creation time. A recent message is a candidate, not proof of relevance:
+the model must connect the trigger to the same decision, commitment, or experiment,
+and ambiguous cases produce no actionable proposal. Source digests, quote bounds,
+authorship, visibility, and the complete trigger set are revalidated at admission,
+claim, approval, and delivery. The host keeps a second
+conservative consumption check over triggering human message IDs within the same guild
+and visibility boundary, so a recreated memory or subject cannot reuse consumed human
+evidence. This check is repeated inside the claim transaction, even for revisions
+registered before another revision consumed their evidence. Comparisons use source
+creation time and a stable message-ID tie-break,
+never proposal or attempt time: a material correction may arrive while an earlier run
+is still in flight, late retrieval never changes source time, and replaying covered
+evidence does not reopen a subject. No comparison reveals restricted subject existence
+to a broader-scope run.
+
+**Gating points.** Attention admission is a baseline eligibility gate before review
+routing: review and forced-review cards consume attention exactly like autonomous
+speech, and an unqualified recommendation is stored as `observed` with a content-free
+reason code (for example `no_recent_human_trigger`, `unrelated_trigger`,
+`revision_consumed`, `deadline_unverified`, `attention_window_expired`,
+`trigger_changed`, `legacy_authority`). Ownership and window validity are rechecked
+inside the approval transaction, immediately before Discord send, and before
+requeueing an uncertain send; already-sent recovery records the actual send first. A
+proactive proposal's `expires_at_ms` is the earlier of the ordinary proposal expiry
+and the attention window end, and configuration changes may shorten but never extend a
+persisted claim's original window. A definite attention failure expires an unsent
+review proposal and queues durable card synchronization; it is not a retryable policy
+block.
+
+**Registration.** Existing recent work without a revision, and explicit future
+deadlines, enter through a bounded scoped registration pass (`attention_registration`
+cohort mode) that may persist a validated revision but never posts: its notification
+flag is always false. A candidate date is not deadline authority; the registration run
+must validate the actual commitment and subject relation through the normal typed
+contract. Registration attempts are marked complete so the same evidence is not
+reconsidered each day, and model-written `reviewAt` is never a registration criterion.
+A legacy payload without an explicit mode is not permission to enter registration
+mode. A registration may be consumed later by an `attention_review` cohort or a fresh
+episode under a new validated snapshot.
+
+**State.** Migration 038 stores attention subjects, members, revisions, revision
+evidence, and proposal claims. Revision evidence keeps quote offsets and content
+digests, never copies of Discord text. Current source visibility and content are
+checked whenever these records are used. Explicit source or user forgetting purges
+source-linked attention data; missing sources fail closed. Migration 039 persists
+the latest deadline set/cancellation with source offsets and digests, accepted instant,
+and captured parser/timezone. Forgetting that decision removes its source-linked row
+and retires its subject's existing revisions. A source-free cutoff at deletion time
+prevents older, previously unregistered evidence from reviving the forgotten deadline;
+only a later human event can register new deadline authority.
 
 ---
 
@@ -1614,13 +1742,18 @@ intervention:
   channel_cooldown_minutes: 180
   global_daily_limit: 5
   max_message_characters: 1800
+  # Proactive speech requires a human trigger created within this many days.
+  attention_window_days: 7
 
 memory:
   minimum_confidence: 0.55
   minimum_importance: 0.60
   followup_horizon_days: 14
   followup_max_messages: 20
+  # Deprecated: parsed for compatibility, ignored by attention admission.
   scheduled_review_reminder_days: 7
+  # Deprecated: parsed for compatibility, ignored by attention admission.
+  staleness_horizon_days: 45
   require_evidence: true
   review_predictions: true
   review_assumptions: true
@@ -1914,6 +2047,18 @@ listed current subjects. The human reply is new evidence. The Cassandra notifica
 and old memory statement are context only and do not prove a postponement, completion,
 or other status change.
 
+Proactive speech needs current work. When you recommend an intervention, identify
+the subject memory in `intervention.subject` and the triggering human development in
+`intervention.trigger`: quote up to three recent episode or follow-up messages in
+which a human made a new commitment, changed a decision, reopened a question,
+reported a specific outcome, or contradicted a stored record. Older memories and
+retrieved history may support the message as context; they are not new human triggers.
+A host-verified explicit human deadline is the only time-based exception: it may
+justify one intervention when it becomes due on an unconsumed revision. Use
+`intervention.trigger.kind = human_deadline`; the host resolves and validates the
+deadline. Never infer deadline authority from `reviewAt` or a missing completion record.
+Otherwise, silence is correct when the only change is that time passed.
+
 Perform the following:
 
 1. Determine whether the episode contains a consequential decision, assumption,
@@ -1939,6 +2084,8 @@ Perform the following:
    Use `project` or `organizational` only when the information will change a
    future decision or prevent repeated work after the conversation scrolls away.
 7. Evaluate whether an intervention would create more value than interruption.
+   Recommend one only with a current trigger: without a valid subject and trigger
+   the host stores the proposal silently, whatever its score.
 8. If intervention is warranted, draft one concise message suitable for the target
    channel. It must stand on permitted evidence and include no unsupported accusations.
 9. Finish by calling `finalize_episode_review` exactly once.
@@ -2171,15 +2318,23 @@ Propose memory updates with valid evidence. Every proposal must include short ve
 `evidenceQuotes` copied from each cited message, a durability classification, and a
 specific durability reason. Do not preserve a stale open question or commitment when
 later evidence resolves, completes, cancels, or supersedes it. Prefer one canonical
-memory over overlapping records. Recommend a notification only when the item is
-material and timely. The host has selected the exact target in the host runtime context.
+memory over overlapping records. Recommend a notification only when a material human
+development inside the attention window makes the subject current: a new commitment,
+a changed decision, an explicit reopening, a specific reported outcome, or a
+contradiction of the stored record. A host-verified explicit human deadline is the
+only time-based exception: it may justify one notification when it becomes due on an
+unconsumed revision. Never infer deadline authority from `reviewAt` or a missing
+completion record. Older evidence may support the notification as context, or as the
+source of that verified deadline; otherwise it is not a reason to speak. The host has
+selected the exact target in the host runtime context.
 Echo that target and never choose another channel.
 
 Always include `notification.subjectMemoryIds`. Use an empty array when you do not
 recommend a notification. For a recommended notification, put the exact due memory ID
-in this field. Cite at least one stored evidence message for the subject memory. The
-host validates this relationship and suppresses repeated reminders about the same
-unchanged subject.
+in this field and echo the due item's `attentionRevisionId` in `notification.attentionRevisionId`.
+Cite at least one stored evidence message for the subject memory. The host validates
+these relationships; one material human development earns at most one notification,
+whatever happened to the earlier attempt.
 
 Before you recommend a notification, call `get_memory_evidence` for the subject memory.
 Put source message IDs in `evidenceMessageIds` and cite only message IDs that your own
@@ -2209,12 +2364,18 @@ For `notification.message` and `notification.reason`, apply these STE rules:
 - Do not expose host or retrieval terms such as "permitted evidence", "routing", or
   "closure".
 
-Example message:
+Stay silent when the only change is time and no verified deadline qualifies.
+Example silence case: the Aurora
+trial ended three weeks ago, no new human message discusses it, and the records
+show no outcome. Do not ask for a status update; keep the memory and recommend
+no notification.
 
-**Pilot service trial: no recorded outcome**
-The pilot service trial extension ended on 14 August 2026 [[cite:1402032985002]].
-The records do not show the trial result or the contract status.
-What is the current status?
+Example message for a current development:
+
+**Gateway cutover moved to Friday**
+The team moved the gateway cutover from Wednesday to Friday [[cite:260000000000000011]].
+The stored decision still says Wednesday, and the runbook was not updated.
+Confirm the new date in the runbook before Friday.
 
 Finish by calling `finalize_scheduled_review` exactly once.
 
@@ -2741,8 +2902,36 @@ const MemoryProposal = Type.Object({
   durabilityReason: Type.String({ minLength: 1, maxLength: 500 }),
   independentReason: Type.Optional(Type.String({ minLength: 20, maxLength: 500 })),
   ownerUserId: Type.Optional(Type.String()),
-  reviewAt: Type.Optional(Type.String({ format: "date-time" })),
+  reviewAt: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })),
   metadata: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
+  attentionChange: Type.Optional(Type.Object({
+    evidence: Type.Array(Type.Object({
+      messageId: Type.String({ minLength: 1, maxLength: 64 }),
+      quote: Type.String({ minLength: 1, maxLength: 500 }),
+    }), { minItems: 1, maxItems: 3 }),
+    relation: Type.Union([
+      Type.Literal("new_commitment"),
+      Type.Literal("changed_decision"),
+      Type.Literal("explicit_reopening"),
+      Type.Literal("specific_outcome"),
+      Type.Literal("contradiction"),
+    ]),
+    materialChange: Type.String({ minLength: 1, maxLength: 500 }),
+  })),
+  deadlineChange: Type.Optional(Type.Union([
+    Type.Object({
+      action: Type.Literal("set"),
+      sourceMessageId: Type.String({ minLength: 1, maxLength: 64 }),
+      quote: Type.String({ minLength: 1, maxLength: 500 }),
+      dateExpression: Type.String({ minLength: 1, maxLength: 64 }),
+      proposedAt: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })),
+    }),
+    Type.Object({
+      action: Type.Literal("clear"),
+      sourceMessageId: Type.String({ minLength: 1, maxLength: 64 }),
+      quote: Type.String({ minLength: 1, maxLength: 500 }),
+    }),
+  ])),
 });
 
 const InterventionProposal = Type.Object({
@@ -2759,6 +2948,38 @@ const InterventionProposal = Type.Object({
   replyToMessageId: Type.Optional(Type.String()),
   evidenceMessageIds: Type.Array(Type.String(), { maxItems: 10 }),
   message: Type.Optional(Type.String({ maxLength: 1800 })),
+  subject: Type.Optional(Type.Union([
+    Type.Object({
+      kind: Type.Literal("existing_memory"),
+      memoryId: Type.String({ minLength: 1, maxLength: 64 }),
+    }),
+    Type.Object({
+      kind: Type.Literal("memory_proposal"),
+      proposalIndex: Type.Integer({ minimum: 0, maximum: 19 }),
+    }),
+  ])),
+  trigger: Type.Optional(Type.Union([
+    Type.Object({
+      kind: Type.Literal("new_human_evidence"),
+      evidence: Type.Array(Type.Object({
+        messageId: Type.String({ minLength: 1, maxLength: 64 }),
+        quote: Type.String({ minLength: 1, maxLength: 500 }),
+      }), { minItems: 1, maxItems: 3 }),
+      relation: Type.Union([
+        Type.Literal("new_commitment"),
+        Type.Literal("changed_decision"),
+        Type.Literal("explicit_reopening"),
+        Type.Literal("specific_outcome"),
+        Type.Literal("contradiction"),
+      ]),
+      materialChange: Type.String({ minLength: 1, maxLength: 500 }),
+    }),
+    Type.Object({
+      kind: Type.Literal("human_deadline"),
+      revisionId: Type.String({ minLength: 1, maxLength: 64 }),
+    }),
+    Type.Object({ kind: Type.Literal("none") }),
+  ])),
 });
 
 const FinalizeEpisodeReview = Type.Object({
@@ -2778,6 +2999,21 @@ The final tool’s `execute` function validates, stores the proposal in the run 
 `targetChannelId` is declarative only. The host compares it against the pinned target for
 the run and rejects the finalization when they differ; the model cannot retarget a
 proposal to another channel.
+
+(Amendment (2026-09-16): `reviewAt` is a bounded ISO-8601 string the host parses with
+`Date.parse`; it records a semantic due date on the memory and never grants attention
+admission. `subject` and `trigger` are optional at the structural boundary so stored
+older outputs and `recommend = false` remain valid; when `recommend` is true the host
+requires a resolvable subject and a valid trigger, and absence fails to `observed`, not
+to an automatic fallback. A `memory_proposal` subject index is resolved only through the
+accepted `applyMemoryProposals(...).applied` mapping after memory mutations: rejected,
+missing, out-of-range, or unexposed subjects suppress speech while independent valid
+memory mutations still succeed. `attentionChange` and `deadlineChange` on a memory
+proposal are processed only after the memory outcome resolves, including canonical
+duplicate-confirm and supersede; their rejection never rolls back a valid memory
+mutation, and every rejection carries a content-free reason. Scheduled notifications
+echo the host-pinned revision in `attentionRevisionId` and cite their triggering
+evidence; historical context citations remain allowed and do not count as the trigger.)
 
 ---
 
@@ -2826,11 +3062,18 @@ An ordinary proactive intervention passes baseline eligibility only when:
 - confidence ≥ configured minimum;
 - evidence strength ≥ configured minimum;
 - at least one cited evidence message was exposed during the run;
+- attention admission passes for a host-validated subject revision: the recommendation
+  carries a valid subject and a recent human trigger, or a due explicit deadline
+  (Section 12.7);
 - content length is within limit;
 - no disallowed mention is present.
 
 Baseline eligibility decides whether an ordinary intervention can proceed to routing; it
-does not by itself authorize delivery. In every mode, the host separately verifies that:
+does not by itself authorize delivery. Attention admission is part of baseline
+eligibility and runs before review routing, so review and forced-review cards consume
+attention exactly like autonomous sends; a recommendation without a valid subject or
+trigger is stored as `observed` with a content-free reason. In every mode, the host
+separately verifies that:
 
 - every cited evidence ID was exposed during the originating run and still resolves to
   current evidence allowed in the target scope;
@@ -2855,11 +3098,13 @@ host-pinned working channel, which must currently set `allow_interventions: true
 Run-exposed citation, current evidence, scope, route, cooldown, limit, duplicate, content,
 and mention checks still apply. A secure-maintenance cohort cannot create a notification.
 
-For a scheduled notification, the model also proposes `subjectMemoryIds`. The host
-validates them against the current due set, run exposure, and cited memory evidence. A
-recommended notification with no valid subject is stored as `observed`. Before creating a
-card and again inside the approval transaction, the host applies the subject-reminder gate
-from Section 12.4. The host hashes the sorted validated subject set into `topic_key` for
+For a scheduled notification, the model also proposes `subjectMemoryIds` and echoes the
+cohort's pinned revision in `attentionRevisionId`. The host validates them against the
+current due set, run exposure, cited memory evidence, and the pinned attention revision.
+A recommended notification with no valid subject or revision echo is stored as
+`observed`. Before creating a card and again inside the approval transaction, the host
+applies the attention admission gate from Section 12.7. The host hashes the sorted
+validated subject set into `topic_key` for
 the ordinary same-topic delivery cooldown. The normalized subject rows, including partial
 overlap between sets, remain the primary scheduled-reminder identity. Text similarity is
 defense in depth and is not the identity of a scheduled topic.
@@ -2895,7 +3140,8 @@ Defaults:
 
 - per target channel: 180 minutes;
 - same memory/topic: 24 hours;
-- same unchanged scheduled-review subject after send or dismissal: 7 days;
+- repeated proactive speech about one subject: prevented by attention consumption per
+  material revision (Section 12.7), not by a cooldown interval;
 - global autonomous posts: 5 per organization day.
 
 Explicit direct questions do not count as autonomous interventions, but rate limits still apply.
@@ -2938,8 +3184,9 @@ Approval behavior:
 2. Confirm the proposal is still `pending_review` and has not passed its deadline.
 3. Re-run current target visibility, originating-run citation, evidence, and scope checks.
 4. Re-check cooldown, daily-limit, and duplicate state.
-5. In one immediate transaction, repeat the subject-reminder check for a scheduled
-   notification, then record approval, approver ID, and timestamp and enqueue the outbox
+5. In one immediate transaction, repeat the scheduled subject checks and the attention
+   ownership and window checks for a scheduled or episode proposal (Section 12.7), then
+   record approval, approver ID, and timestamp and enqueue the outbox
    row plus its send job.
 6. Edit the review message to show that approval succeeded and delivery is queued.
 7. Let the outbox worker publish later and record `sent` or terminal `failed` separately.
@@ -2951,7 +3198,8 @@ it to `approved`, dismissal moves it to `dismissed`, and deadline handling moves
 
 Dismissal stores an optional reason for evaluation.
 
-Proposal expiry defaults to 72 hours.
+Proposal expiry defaults to 72 hours. A proactive proposal's deadline is the earlier of
+that expiry and its attention window end (Section 12.7).
 
 Scheduled-review proposal cards:
 
@@ -3879,6 +4127,99 @@ CREATE TABLE IF NOT EXISTS scheduled_review_cohort_subject_leases (
 CREATE INDEX IF NOT EXISTS scheduled_review_cohort_subject_leases_job_idx
   ON scheduled_review_cohort_subject_leases(job_id);
 
+CREATE TABLE attention_subjects (
+  id TEXT PRIMARY KEY,
+  guild_id TEXT NOT NULL REFERENCES guilds(id),
+  deadline_forget_cutoff_at_ms INTEGER,
+  registration_state TEXT NOT NULL
+    CHECK (registration_state IN ('pending', 'complete')),
+  created_at_ms INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX attention_subjects_guild_idx
+  ON attention_subjects(guild_id, created_at_ms);
+
+CREATE TABLE attention_subject_members (
+  memory_id TEXT PRIMARY KEY REFERENCES memories(id),
+  subject_id TEXT NOT NULL REFERENCES attention_subjects(id),
+  created_at_ms INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX attention_subject_members_subject_idx
+  ON attention_subject_members(subject_id, memory_id);
+
+CREATE TABLE attention_revisions (
+  id TEXT PRIMARY KEY,
+  subject_id TEXT NOT NULL REFERENCES attention_subjects(id),
+  revision_key TEXT NOT NULL CHECK (length(revision_key) > 0),
+  human_event_at_ms INTEGER NOT NULL,
+  explicit_deadline_at_ms INTEGER,
+  deadline_timezone TEXT,
+  deadline_parser_version TEXT,
+  state TEXT NOT NULL
+    CHECK (state IN ('current', 'superseded', 'invalidated', 'legacy_consumed')),
+  created_at_ms INTEGER NOT NULL,
+  UNIQUE (subject_id, revision_key)
+) STRICT;
+
+CREATE INDEX attention_revisions_subject_idx
+  ON attention_revisions(subject_id, human_event_at_ms, id);
+
+CREATE TABLE attention_revision_evidence (
+  revision_id TEXT NOT NULL REFERENCES attention_revisions(id),
+  message_id TEXT NOT NULL REFERENCES messages(id),
+  role TEXT NOT NULL
+    CHECK (role IN ('material_trigger', 'explicit_deadline')),
+  source_content_digest TEXT NOT NULL CHECK (length(source_content_digest) > 0),
+  quote_start INTEGER NOT NULL CHECK (quote_start >= 0),
+  quote_end INTEGER NOT NULL CHECK (quote_end >= quote_start),
+  PRIMARY KEY (revision_id, message_id, role)
+) STRICT;
+
+CREATE INDEX attention_revision_evidence_message_idx
+  ON attention_revision_evidence(message_id);
+
+CREATE TABLE proposal_attention_claims (
+  revision_id TEXT PRIMARY KEY REFERENCES attention_revisions(id),
+  proposal_id TEXT UNIQUE REFERENCES proposals(id) ON DELETE SET NULL,
+  consumed_at_ms INTEGER NOT NULL,
+  eligible_from_ms INTEGER NOT NULL,
+  eligible_until_ms INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX proposal_attention_claims_proposal_idx
+  ON proposal_attention_claims(proposal_id)
+  WHERE proposal_id IS NOT NULL;
+
+CREATE TABLE attention_deadline_decisions (
+  subject_id TEXT PRIMARY KEY REFERENCES attention_subjects(id) ON DELETE CASCADE,
+  source_message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+  source_created_at_ms INTEGER NOT NULL,
+  source_content_digest TEXT NOT NULL CHECK (length(source_content_digest) > 0),
+  quote_start INTEGER NOT NULL CHECK (quote_start >= 0),
+  quote_end INTEGER NOT NULL CHECK (quote_end > quote_start),
+  action TEXT NOT NULL CHECK (action IN ('set', 'clear')),
+  revision_id TEXT REFERENCES attention_revisions(id) ON DELETE CASCADE,
+  deadline_at_ms INTEGER,
+  deadline_timezone TEXT,
+  deadline_parser_version TEXT,
+  deadline_basis TEXT,
+  date_expression_digest TEXT,
+  recorded_at_ms INTEGER NOT NULL,
+  CHECK (
+    (action = 'clear' AND revision_id IS NULL AND deadline_at_ms IS NULL
+      AND deadline_timezone IS NULL AND deadline_parser_version IS NULL
+      AND deadline_basis IS NULL AND date_expression_digest IS NULL)
+    OR
+    (action = 'set' AND revision_id IS NOT NULL AND deadline_at_ms IS NOT NULL
+      AND deadline_timezone IS NOT NULL AND deadline_parser_version IS NOT NULL AND deadline_basis IS NOT NULL
+      AND deadline_basis IN ('iso_date', 'iso_timestamp', 'day_month_year', 'relative_word', 'weekday', 'legacy'))
+  )
+) STRICT;
+
+CREATE INDEX attention_deadline_decisions_source_idx
+  ON attention_deadline_decisions(source_message_id);
+
 CREATE TABLE IF NOT EXISTS outbox (
   id TEXT PRIMARY KEY,
   proposal_id TEXT REFERENCES proposals(id),
@@ -4152,7 +4493,8 @@ CREATE TABLE IF NOT EXISTS admin_events (
   `030_inspector_memory_recent_sort`, `031_scheduled_review_routing`,
   `032_proposal_review_message_index`, `033_inspector_run_observability`, and
   `034_agent_run_usage_breakdown`, `035_episode_reasoning_shadow`, and
-  `036_agent_run_execution_start` are explicit
+  `036_agent_run_execution_start`, `037_ingestion_recovery`,
+  `038_proactive_attention`, and `039_deadline_decisions` are explicit
   forward-only boundaries. Migration 028
   is the indexed cursor boundary for the thread-aware channel inspector. Migration 029 adds deterministic keyset indexes
   for the remaining inspector archives: memories, memory evidence, proposals, outbox
@@ -4207,6 +4549,27 @@ CREATE TABLE IF NOT EXISTS admin_events (
   cohort leases, and the reverse outbox message-ID index used by exact reply feedback.
   These rows are caches/coordination state only; current memory evidence, scope, channel
   policy, and run provenance are recomputed at every authority boundary.
+
+  Migration 037 adds ingestion gap recovery state. It does not rewrite ingestion history.
+
+  Migration 038 adds the proactive-attention tables (Section 12.7): host-assigned
+  subjects with memory membership, material human revisions keyed by triggering message
+  identities, revision evidence stored as quote offsets and content digests rather than
+  copies of Discord text, and one proposal claim per revision. Applying the migration
+  confers no attention authority: the startup cutover marks previously surfaced legacy
+  evidence as consumed, expires legacy pending proactive proposals, and invalidates
+  legacy cohort payloads without revision identity. The cutover is bounded, idempotent,
+  and crash-safe, and it performs no Discord or model I/O. An image without
+  `038_proactive_attention.sql` must not start after migration 038 is recorded; recovery
+  requires a forward image or a verified pre-038 restore.
+
+  Migration 039 adds source-ordered deadline decisions and a source-free forgetting
+  cutoff. Existing accepted deadlines keep their original instant and parser/timezone;
+  old cleared authority without a cancellation source is retired. An image lacking
+  `039_deadline_decisions.sql` must not start after 039 is recorded; use a forward
+  image or a verified pre-039 restore. Cutover version 2 processes legacy proposals
+  with a bounded keyset cursor, repairs missed legacy evidence, and preserves
+  modern proposal-owned revisions.
 
 ---
 
@@ -4991,6 +5354,9 @@ MIN_EVIDENCE_STRENGTH=0.65
 MIN_INTERVENTION_CONFIDENCE=0.65
 CHANNEL_COOLDOWN_MINUTES=180
 GLOBAL_AUTONOMOUS_POST_LIMIT_PER_DAY=5
+# A proactive trigger must be a human message created within this many days
+# (Section 12.7). Positive integer; 0 is invalid.
+INTERVENTION_ATTENTION_WINDOW_DAYS=7
 
 DIRECT_ANSWER_ENABLED=true
 LLM_DAILY_BUDGET_USD=2
@@ -5017,7 +5383,9 @@ MEMORY_MINIMUM_CONFIDENCE=0.55
 MEMORY_MINIMUM_IMPORTANCE=0.60
 MEMORY_FOLLOWUP_HORIZON_DAYS=14
 MEMORY_FOLLOWUP_MAX_MESSAGES=20
+# Deprecated: parsed for compatibility, ignored by attention admission.
 MEMORY_SCHEDULED_REVIEW_REMINDER_DAYS=7
+# Deprecated: parsed for compatibility, ignored by attention admission.
 MEMORY_STALENESS_HORIZON_DAYS=45
 MEMORY_REQUIRE_EVIDENCE=true
 MEMORY_REVIEW_PREDICTIONS=true
@@ -5908,8 +6276,12 @@ Test:
   OpenAI-Responses-only payload replacement, malformed-input fallback, and key privacy;
 - byte parity between the canonical scheduled-review template in Section 20 and the live
   template, including its operational ASD-STE100 rules;
-- scheduled-subject validation, deterministic topic keys, fingerprint comparison,
-  partial-overlap blocking, and reminder-interval boundaries;
+- scheduled-subject validation, deterministic topic keys, fingerprint comparison, and
+  partial-overlap blocking;
+- proactive attention admission (Section 12.7): exact window boundaries, immutable
+  revision identity and idempotent re-extraction, one-opportunity consumption across
+  every terminal state, deadline grammar and window boundaries, ownership under
+  concurrent claims, and cutover idempotence;
 - scheduled origin routing, supersede-lineage bounds, exact-thread targets, cohort
   grouping/fairness/leases, and exact reply-to-outbox feedback association;
 - migration application;
@@ -5945,10 +6317,20 @@ Use recorded synthetic Discord fixtures to test:
 - outbox retry;
 - outbox `sending`-state crash recovery;
 - scheduled-review notifications with missing, malformed, not-due, or uncited subjects;
-  paraphrased proposals for the same subject; partial subject-set overlap; unchanged and
+  paraphrased or repeated proposals for the same consumed revision; a materially newer
+  human development reopening a subject once; explicit deadlines becoming due exactly
+  once; partial subject-set overlap; unchanged and
   changed fingerprints after send or dismissal; subjects resolved in the same run; stale
   pending cards; unrelated subjects; and a concurrent approval attempt in which only the
   deterministic earlier proposal can reserve delivery;
+- proactive attention admission (Section 12.7): old-only evidence, identical evidence
+  with fresh extraction or confirmation dates, bot or unknown-author triggers, future
+  timestamps, deleted or inaccessible sources, and unrelated same-entity activity all
+  produce zero review-channel and autonomous sends, including high-score and
+  forced-review proposals; fresh supported contradictions stay eligible; a correction
+  arriving while an earlier run is in flight still forms a new revision; legacy
+  cutover leaves no unsolicited resurfacing; and explicit forgetting purges
+  source-linked attention data;
 - target-scoped scheduled cohorts, including working-channel card/delivery separation,
   secure-maintenance silence, stale snapshots, route drift at proposal/approval/send,
   legacy unsent cancellation, and short exact human replies that update subjects;
@@ -6204,6 +6586,10 @@ The v1 implementation is complete when all are true:
   pre-027 restore is required after it is recorded.
 - Migration 031 persists bounded dispatch fairness and cohort ownership without treating
   either as routing authority, and supports exact sent-message feedback lookup.
+- Migration 038 persists attention subjects, revisions, evidence digests, and one
+  proposal claim per revision without conferring attention authority on legacy rows; the
+  startup cutover is bounded, idempotent, and crash-safe, and a second run changes
+  nothing.
 - Migration 034 adds nullable detailed model-usage accounting without inferring legacy
   values or changing the combined totals used for budgets and settlements.
 - Online backup and restore are tested.
@@ -6273,19 +6659,32 @@ The v1 implementation is complete when all are true:
   be inspected by an authenticated administrator.
 - Outbox dedupe plus `sending`-state recovery (Section 10.1) prevents duplicate Discord messages after a crash.
 - A recommended scheduled notification becomes actionable only with a host-validated due
-  subject whose stored evidence overlaps its validated citations. Invalid or missing
+  subject whose stored evidence overlaps its validated citations, and only through the
+  attention gate in Section 12.7. Invalid or missing
   subject declarations remain `observed` and never create a review card.
-- An earlier actionable proposal, nonterminal approved delivery, or recent unchanged
-  sent/dismissed subject suppresses a repeated scheduled-review card even when the model
-  paraphrases it. A changed fingerprint and an unrelated subject pass this subject gate.
-- Approval repeats the scheduled-subject check inside the immediate approval transaction,
-  so overlapping duplicate cards cannot both enqueue delivery.
+- Proactive speech requires a host-validated subject revision with a recent human
+  trigger, or an explicit source-verified deadline that has become due. Old-only
+  evidence produces zero review-channel and autonomous sends, including high-score and
+  forced-review proposals, and history remains available.
+- No timer, model-written `reviewAt`, confirmation, metadata change, new memory UUID,
+  changed stance, supersession, alias, or replay of covered evidence can grant another
+  proactive opportunity. One material revision earns exactly one actionable proposal
+  across approval, sending, dismissal, expiry, failure, restart, and uncertain card
+  delivery, while a materially newer human development creates a new revision eligible
+  once.
+- Approval repeats the attention ownership and window checks inside the immediate
+  approval transaction, so overlapping duplicate cards cannot both enqueue delivery, and
+  an owner can approve and send within its immutable window.
 - A subject resolved during its scheduled run cannot create a card. A subject changed
   after card creation makes that card stale: it does not block a fresh card, and approval
   expires it without delivery.
-- A due memory past the staleness horizon never dispatches for scheduled review. The
-  maintenance sweep expires it silently with one content-free audit event per memory,
-  and re-running the sweep changes nothing.
+- An approved proposal whose attention window closes before the outbox runs is cancelled
+  without sending or replacement; recovery that finds an already-sent Discord marker
+  after expiry records the send and never resends or denies reality. Direct answers
+  without proposal IDs are unaffected.
+- The maintenance sweep expires closed attention opportunities with one content-free
+  audit event per revision and never changes durable memory status because of age alone;
+  re-running the sweep changes nothing.
 - Scheduled-review sources render as masked descriptive channel/date links inline in the
   delivered text, with the host identity footer appended. Approval shows delivery
   queued, and durable outbox completion changes the card to sent with a notification link
