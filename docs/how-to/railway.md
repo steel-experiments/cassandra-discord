@@ -6,16 +6,15 @@ released container image. It does not set up Discord or the model provider.
 You bring your own Discord application, your own provider key, and your own
 channel selection.
 
-> **Template status: not published yet.** The Railway template has not been
-> created, and a live template install has not been verified. This page
-> describes the contract the template will provision. The deploy control below
-> is a placeholder until launch day.
+> **Template status: published 2026-09-16.** The template at
+> <https://railway.com/template/cassandra-for-discord> provisions exactly the
+> contract on this page: one service from the digest-pinned release image, one
+> volume at `/app/data`, and the `/readyz` health check. The seed install was
+> verified live on 2026-09-16, including the released image, the volume, and
+> the backup drill. The anonymous template definition was checked variable by
+> variable: every default is empty and the two secrets carry no value.
 
-<!-- TODO-template-URL: on launch day, replace the placeholder line below with
-     the published template URL, remove this comment, and re-check this page
-     against the real template fields. -->
-
-Deploy control: `TODO-template-URL`
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/template/cassandra-for-discord)
 
 ## Prerequisites
 

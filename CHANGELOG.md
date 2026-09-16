@@ -11,8 +11,9 @@ not recorded.
 
 ## [1.0.0] - 2026-09-16
 
-This entry is the launch baseline. It becomes version 1.0.0 when the first
-release is published. The release date is set at launch.
+First public release. The container image is published at
+`ghcr.io/steel-experiments/cassandra-discord` and the Railway template at
+<https://railway.com/template/cassandra-for-discord>.
 
 ### Added
 

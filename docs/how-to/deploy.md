@@ -7,9 +7,9 @@ start with [Install with the released image](#install-with-the-released-image).
 The repository also includes source-build configuration for Docker Compose,
 Coolify, and Railway.
 
-> **Release status: no image is published yet.** The image is built and
-> smoke-tested locally on amd64 and arm64. The release workflow, the GitHub
-> hosted runners, and the Railway template install have not been exercised.
+> **Release status: v1.0.0 published 2026-09-16.** The release workflow
+> verified the image on both architectures before the push, published it with
+> its digest in the release notes, and the same image runs live on Railway.
 > The released-image sections below describe the intended release contract.
 > Until the first tag exists, use
 > [Deploy with Docker Compose from source](#deploy-with-docker-compose-from-source).
@@ -124,10 +124,9 @@ version instead of `latest`.
 
 ### Processor architectures
 
-The release contract is that each release builds images for AMD64 and ARM64
-and runs the container smoke test on both architectures before the release is
-published. So far, the image has been built and smoke-tested locally on both
-architectures; the release workflow has not run yet. Docker selects the
+Each release builds images for AMD64 and ARM64 and runs the container smoke
+test on both architectures before the image is published. The v1.0.0 release
+exercised the full path on 2026-09-16. Docker selects the
 matching architecture for the host automatically, and the digest you record
 pins the multi-architecture manifest, so the same pinned reference works on
 both.

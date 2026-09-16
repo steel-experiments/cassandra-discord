@@ -30,9 +30,9 @@ ask the human for every value in the table in Step 2 and must never invent a
 Discord ID or paste a token anywhere except `.env` or the hosting platform's
 variable store.
 
-Release status: the container image and the Railway template are not
-published yet. Until the first release, install from source with Option B or
-Option C below.
+Cassandra for Discord 1.0.0 is released. The container image is published
+at `ghcr.io/steel-experiments/cassandra-discord` (each release records its
+digest), and the Railway template is live.
 
 ## Quick path
 
@@ -168,13 +168,9 @@ npm start
 from the released image, one volume at `/app/data`, one replica, a `/readyz`
 health check, and a 45-second shutdown drain. Set the Step 2 variables as
 service variables; Railway rejects an empty value, so leave an empty list
-unset. Available after the first release. See
-[Deploy on Railway](docs/how-to/railway.md).
+unset. See [Deploy on Railway](docs/how-to/railway.md).
 
-<!-- TODO-template-URL: on launch day, replace the placeholder line below with
-     the published template URL and remove this comment. -->
-
-Deploy button: `TODO-template-URL`
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/template/cassandra-for-discord)
 
 Check: the log shows `cassandra starting`, then the process becomes ready.
 Use `docker compose logs -f cassandra` or the terminal of a native run.

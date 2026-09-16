@@ -6,7 +6,7 @@ operator checks. The publishing workflow is
 publication contract is spec Section 38.7.
 
 Status at the time of writing: **no release has been published yet.** See
-[What has not run live](#what-has-not-run-live) before you trust a step.
+[First live run](#first-live-run) for the recorded baseline of v1.0.0.
 
 ## Before you tag
 
@@ -77,17 +77,21 @@ No manual steps run here. The workflow:
    convenience pointer, and the operator contract is stop-and-start, never an
    overlapping rolling replacement.
 
-## What has not run live
+## First live run
 
-The first release is still pending. Until then, treat this document as
-procedure, not as a record of verified runs:
+The v1.0.0 tag on 2026-09-16 exercised this process end to end:
 
-- The tag-to-publish path has never produced an image. The verify jobs, the
-  multi-arch push, the digest summary, and the draft release have not run in
-  this repository.
-- No published release notes exist, so no operator digest check has happened.
-- No install or upgrade against a released image has happened. Live checks
-  against Discord and Railway have not been run.
-- The Railway deploy template has not been created; its URL is a tracked
-  launch blocker, and the install docs hold a marked placeholder for it until
-  launch day.
+- Workflow run 35117498306: verify on linux/amd64 and linux/arm64, the
+  multi-arch push, the digest summary, and the draft release all passed.
+- The published manifest digest is
+  `sha256:87c5fc4ce070edcfad3ebc5008795cd5185b387e6e5363c9024b3c0b43e34309`,
+  built from tagged commit `fcbf92b`; the revision label is baked into the
+  image and appears in the startup log of a running deployment.
+- The released image ran live on Railway (digest-pinned service source,
+  deployment 4e9bd17c) with an existing volume, and the Railway backup drill
+  passed against it.
+- The Railway template publishes from that digest-pinned service:
+  <https://railway.com/template/cassandra-for-discord>.
+
+Treat older history below this section as procedure only. Items that remain
+unverified after v1.0.0: none known.
