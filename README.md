@@ -5,6 +5,11 @@ turns permitted conversations into durable, evidence-backed memory: decisions,
 assumptions, predictions, risks, open questions, and commitments. Most of the
 time, it says nothing. It is unrelated to the Apache Cassandra database.
 
+Through Model Context Protocol (MCP), Cassandra also gives your coding agents
+access to that memory. Connect Codex, Claude Code, or another compatible client
+so your agent can check the team's decisions and constraints before writing code
+or making a plan. [Connect your agent](docs/how-to/connect-mcp-clients.md).
+
 ## Set it up with your coding agent
 
 Copy and paste this prompt into Codex, Claude Code, Cursor, or another coding
@@ -32,6 +37,31 @@ should never pass through the agent's chat.
 
 Prefer to work through it yourself? Follow [Install Cassandra](docs/tutorials/getting-started.md)
 or the focused [Railway guide](docs/how-to/railway.md).
+
+## Give your agents the team's memory
+
+Cassandra's MCP server lets a connected agent search Discord conversations,
+retrieve decisions and risks, and follow the source messages behind each memory.
+A new agent session can consult earlier discussions without you having to find
+and paste them into every task. Try requests like:
+
+```text
+Before changing the API client, check Cassandra for our rate-limit decisions.
+Review this migration plan against risks the team has already discussed.
+Summarize this week's deployment discussions and cite the source messages.
+```
+
+![An agent searches Cassandra's memories and Discord conversations to suggest blog ideas with source links.](assets/cassandra-mcp.png)
+
+An agent turns past Discord discussions into blog ideas, with links to the
+source messages.
+
+MCP access is read-only and scoped per credential. Restricted channels require
+explicit grants; clients cannot change memories or send Discord messages through
+Cassandra. MCP is optional and disabled by default. See
+[Connect MCP clients](docs/how-to/connect-mcp-clients.md) for setup and
+[the MCP reference](docs/reference/http-and-mcp.md) for available tools and access
+rules.
 
 ## What Cassandra does
 
@@ -98,6 +128,7 @@ Administrative actions use the role-gated `/cassandra` commands. Start with
 
 - [Install Cassandra](docs/tutorials/getting-started.md)
 - [Deploy on Railway](docs/how-to/railway.md)
+- [Connect MCP clients](docs/how-to/connect-mcp-clients.md)
 - [Use Cassandra](docs/how-to/use-cassandra.md)
 - [Configure Cassandra](docs/reference/configuration.md)
 - [Roll out review and autonomy safely](docs/how-to/roll-out-safely.md)
