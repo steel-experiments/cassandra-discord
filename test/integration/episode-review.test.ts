@@ -289,6 +289,7 @@ function interventionRuntimeContext(): BootstrapContext {
         maxMessageCharacters: 1_800,
         channelCooldownMinutes: 180,
         globalDailyLimit: 5,
+        attentionWindowDays: 7,
       },
     },
     logger: { warn: () => undefined },
@@ -634,6 +635,8 @@ describe('review_episode — orchestration (stubbed executor)', () => {
 });
 
 describe('episode intervention citation exposure', () => {
+  // Rechecks below still assert the specific provenance failure. Manually
+  // inserted proposals without a claim also expire as legacy attention records.
   beforeEach(() => {
     env.db.prepare('UPDATE channels SET allow_interventions = 1 WHERE id = ?').run(CHANNEL);
   });
@@ -724,8 +727,8 @@ describe('episode intervention citation exposure', () => {
       now: NOW,
     }, { db: env.db });
 
-    expect(resolution.outcome).toBe('policy_blocked');
-    expect(getProposal(env.db, proposalId)?.status).toBe('pending_review');
+    expect(resolution.outcome).toBe('expired');
+    expect(getProposal(env.db, proposalId)?.status).toBe('expired');
     expect(getOutboxByDedupeKey(env.db, `proposal:${proposalId}`)).toBeUndefined();
     expect(outboxCount()).toBe(0);
   });
@@ -774,6 +777,13 @@ describe('episode intervention citation exposure', () => {
           targetChannelId: CHANNEL,
           evidenceMessageIds: [evidenceId],
           message: 'Please reconcile this decision before proceeding.',
+          subject: { kind: 'existing_memory', memoryId },
+          trigger: {
+            kind: 'new_human_evidence',
+            evidence: [{ messageId: evidenceId, quote: 'Please reconcile the current launch decision.' }],
+            relation: 'contradiction',
+            materialChange: 'The current episode contradicts the stored launch decision.',
+          },
         },
       };
 
@@ -787,6 +797,8 @@ describe('episode intervention citation exposure', () => {
           episode: getEpisode(env.db, episodeId)!,
           scope: { grant: ORG_GRANT, target: { label: '#general', visibility: 'restricted' } },
           now: NOW,
+          memoryOutcome: { applied: [], rejected: [], total: 0 },
+          episodeMessageIds: new Set([evidenceId]),
         },
       );
 
@@ -852,8 +864,8 @@ describe('episode intervention citation exposure', () => {
         now: NOW,
       }, { db: env.db });
 
-      expect(resolution.outcome).toBe('policy_blocked');
-      expect(getProposal(env.db, proposalId)?.status).toBe('pending_review');
+      expect(resolution.outcome).toBe('expired');
+      expect(getProposal(env.db, proposalId)?.status).toBe('expired');
       expect(getOutboxByDedupeKey(env.db, `proposal:${proposalId}`)).toBeUndefined();
       expect(outboxCount()).toBe(0);
     },
@@ -898,7 +910,7 @@ describe('episode intervention citation exposure', () => {
       recheck,
       now: NOW,
     }, { db: env.db });
-    expect(resolution.outcome).toBe('policy_blocked');
+    expect(resolution.outcome).toBe('expired');
     expect(getOutboxByDedupeKey(env.db, `proposal:${proposalId}`)).toBeUndefined();
   });
 
@@ -946,7 +958,7 @@ describe('episode intervention citation exposure', () => {
       recheck,
       now: NOW,
     }, { db: env.db });
-    expect(resolution.outcome).toBe('policy_blocked');
+    expect(resolution.outcome).toBe('expired');
     expect(getOutboxByDedupeKey(env.db, `proposal:${proposalId}`)).toBeUndefined();
   });
 
@@ -1003,6 +1015,8 @@ describe('episode intervention citation exposure', () => {
           episode: getEpisode(env.db, episodeId)!,
           scope: { grant: ORG_GRANT, target: { label: '#general', visibility: 'restricted' } },
           now: NOW,
+          memoryOutcome: { applied: [], rejected: [], total: 0 },
+          episodeMessageIds: new Set([evidenceId]),
         },
       );
       const stored = getProposal(env.db, proposalId!);

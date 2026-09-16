@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createTestDb, seedIdentity, type TestDb } from '../helpers/db.js';
+import * as attentionRepository from '../../src/memory/attention-repository.js';
 import { resolveScheduledMemoryRoute } from '../../src/memory/scheduled-routing.js';
 import { createReviewDueMemoryDispatcherHandler } from '../../src/jobs/handlers/review-due-memory-dispatcher.js';
 
@@ -113,18 +114,46 @@ describe('scheduled memory routing', () => {
   it('dispatches a bounded target cohort with durable subject ownership', () => {
     message('m-dispatch', WORKING);
     memory('memory-dispatch', 'org', null, ['m-dispatch']);
-    const report = createReviewDueMemoryDispatcherHandler({ db: env.db, ...options, now: () => NOW }).dispatch();
-    expect(report).toEqual({ considered: 1, enqueued: 1, suppressed: 0 });
-    const job = env.db.prepare("SELECT payload_json FROM jobs WHERE type='review_due_memory_cohort'").get() as
+    // With no revision yet, the uncovered in-window evidence queues a scoped
+    // registration cohort that can never post (Section 12.7).
+    const first = createReviewDueMemoryDispatcherHandler({ db: env.db, ...options, now: () => NOW }).dispatch();
+    expect(first).toEqual({
+      considered: 0, enqueued: 0, suppressed: 0,
+      registrationCandidates: 1, registrationEnqueued: 1,
+    });
+    let job = env.db.prepare("SELECT payload_json FROM jobs WHERE type='review_due_memory_cohort'").get() as
       | { payload_json: string }
       | undefined;
     expect(JSON.parse(job!.payload_json)).toMatchObject({
-      routeKind: 'working', targetChannelId: WORKING,
+      routeKind: 'working', targetChannelId: WORKING, mode: 'attention_registration',
       subjects: [{ memoryId: 'memory-dispatch' }],
     });
     expect(env.db.prepare('SELECT memory_id FROM scheduled_review_cohort_subject_leases').get())
       .toEqual({ memory_id: 'memory-dispatch' });
-    expect(createReviewDueMemoryDispatcherHandler({ db: env.db, ...options, now: () => NOW + 1 }).dispatch())
-      .toEqual({ considered: 0, enqueued: 0, suppressed: 0 });
+
+    // An eligible revision dispatches an attention_review cohort that pins it.
+    const { ensureSubjectForMember, registerRevision, validateTriggerEvidence } = attentionRepository;
+    const subjectId = ensureSubjectForMember(env.db, { guildId: GUILD, memoryId: 'memory-dispatch', now: NOW });
+    const records = validateTriggerEvidence(env.db, {
+      guildId: GUILD, cassandraId: 'cassandra-app',
+      evidence: [{ messageId: 'm-dispatch', quote: 'evidence m-dispatch' }],
+      now: NOW, windowMs: 7 * 86_400_000,
+    });
+    if (!records.ok) throw new Error('expected valid trigger evidence');
+    const { revisionId } = registerRevision(env.db, { subjectId, triggers: records.records, now: NOW });
+
+    env.db.prepare('DELETE FROM jobs').run();
+    env.db.prepare('DELETE FROM scheduled_review_cohort_subject_leases').run();
+    const second = createReviewDueMemoryDispatcherHandler({ db: env.db, ...options, now: () => NOW + 1 }).dispatch();
+    expect(second).toMatchObject({ considered: 1, enqueued: 1, suppressed: 0 });
+    job = env.db.prepare("SELECT payload_json FROM jobs WHERE type='review_due_memory_cohort'").get() as
+      | { payload_json: string }
+      | undefined;
+    expect(JSON.parse(job!.payload_json)).toMatchObject({
+      routeKind: 'working', targetChannelId: WORKING, mode: 'attention_review',
+      subjects: [{ memoryId: 'memory-dispatch', attentionRevisionId: revisionId }],
+    });
+    expect(env.db.prepare('SELECT memory_id FROM scheduled_review_cohort_subject_leases').get())
+      .toEqual({ memory_id: 'memory-dispatch' });
   });
 });

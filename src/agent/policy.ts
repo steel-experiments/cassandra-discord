@@ -13,6 +13,7 @@ import type { VisibilityClass } from '../db/repositories/channels.js';
 import type { AutonomyMode } from '../config.js';
 import type { CooldownDecision } from './cooldowns.js';
 import type { DuplicateResult } from './duplicate-policy.js';
+import type { AttentionRejectionReason } from '../memory/attention.js';
 
 /** The six model-supplied dimensions, each expected in [0, 1]. */
 export interface InterventionDimensions {
@@ -653,6 +654,26 @@ export interface ProposalRoutingInput {
   forcedReview: ForcedReviewResult;
   cooldown: CooldownDecision;
   duplicate: DuplicateResult;
+  /** Proactive attention admission (Section 12.7). */
+  attention: AttentionRoutingInput;
+}
+
+/**
+ * Proactive attention admission threaded into routing (Section 12.7). A
+ * recommendation that requires attention authority (`required`) must carry an
+ * eligible, unconsumed revision; otherwise it is stored `observed` in every
+ * mode, including review and forced-review cards.
+ */
+export interface AttentionRoutingInput {
+  required: boolean;
+  eligible: boolean;
+  reason?: AttentionRejectionReason;
+  /** The revision that authorizes speech, claimed at persistence. */
+  revisionId?: string;
+  /** Immutable window start of that revision. */
+  windowFromMs?: number;
+  /** Immutable window end of that revision. */
+  windowUntilMs?: number;
 }
 
 export interface ProposalRoutingResult {
@@ -726,6 +747,15 @@ export function routeProposal(input: ProposalRoutingInput): ProposalRoutingResul
     for (const r of input.forcedReview.rules) {
       reasons.push(`forced review (${r.rule}): ${r.detail}`);
     }
+  }
+
+  // C2. Proactive attention admission (Section 12.7): a baseline eligibility
+  //     gate placed before the mode switch, so review and forced-review cards
+  //     consume attention exactly like autonomous sends. An unqualified
+  //     recommendation has no current reason to speak and is stored observed.
+  if (input.attention.required && !input.attention.eligible) {
+    reasons.push(`attention gate (${input.attention.reason ?? 'unqualified'}): no current reason to speak`);
+    return { state: 'observed', score, reasons };
   }
 
   // D. Deployment mode (Section 24.3).

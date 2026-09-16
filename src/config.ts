@@ -159,6 +159,13 @@ export interface InterventionConfig {
   channelCooldownMinutes: number;
   globalDailyLimit: number;
   maxMessageCharacters: number;
+  /**
+   * Proactive attention window in days (Section 12.7). A normal proactive
+   * trigger is a human message created within this window of now. One material
+   * revision of a subject earns at most one speaking opportunity; an explicit
+   * human deadline may reopen an unconsumed revision once when it becomes due.
+   */
+  attentionWindowDays: number;
 }
 
 export interface MemoryConfig {
@@ -166,8 +173,19 @@ export interface MemoryConfig {
   minimumImportance: number;
   followupHorizonDays: number;
   followupMaxMessages: number;
+  /**
+   * Deprecated: parsed for backward compatibility with existing configuration
+   * files, but no longer controls notification admission. Repeated proactive
+   * speech is bounded by attention consumption per material revision
+   * (Section 12.7), not by a reminder interval.
+   */
   scheduledReviewReminderDays: number;
-  /** Due memories older than this many days expire instead of dispatching; 0 disables (Section 12.4). */
+  /**
+   * Deprecated: parsed for backward compatibility with existing configuration
+   * files, but no longer controls notification admission or memory status.
+   * Attention opportunities expire by their own windows (Section 12.7); the
+   * durable memory lifecycle keeps its semantic states.
+   */
   stalenessHorizonDays: number;
   requireEvidence: boolean;
   reviewPredictions: boolean;
@@ -387,6 +405,7 @@ export const DEFAULTS = {
     channelCooldownMinutes: 180,
     globalDailyLimit: 5,
     maxMessageCharacters: 1800,
+    attentionWindowDays: 7,
   },
   memory: {
     minimumConfidence: 0.55,
@@ -808,6 +827,7 @@ export function loadConfig(options: LoadConfigOptions = {}): AppConfig {
     channelCooldownMinutes: parseInt_(env(e, 'CHANNEL_COOLDOWN_MINUTES'), intOr(iv.channel_cooldown_minutes, DEFAULTS.intervention.channelCooldownMinutes), 'CHANNEL_COOLDOWN_MINUTES'),
     globalDailyLimit: parseInt_(env(e, 'GLOBAL_AUTONOMOUS_POST_LIMIT_PER_DAY'), intOr(iv.global_daily_limit, DEFAULTS.intervention.globalDailyLimit), 'GLOBAL_AUTONOMOUS_POST_LIMIT_PER_DAY'),
     maxMessageCharacters: parseInt_(env(e, 'CASSANDRA_MAX_MESSAGE_CHARACTERS'), intOr(iv.max_message_characters, DEFAULTS.intervention.maxMessageCharacters), 'CASSANDRA_MAX_MESSAGE_CHARACTERS'),
+    attentionWindowDays: parseInt_(env(e, 'INTERVENTION_ATTENTION_WINDOW_DAYS'), intOr(iv.attention_window_days, DEFAULTS.intervention.attentionWindowDays), 'INTERVENTION_ATTENTION_WINDOW_DAYS'),
   };
   assertFraction(intervention.threshold, 'INTERVENTION_THRESHOLD');
   assertFraction(intervention.minEvidenceStrength, 'MIN_EVIDENCE_STRENGTH');
@@ -815,6 +835,7 @@ export function loadConfig(options: LoadConfigOptions = {}): AppConfig {
   assertPositive(intervention.channelCooldownMinutes, 'CHANNEL_COOLDOWN_MINUTES');
   assertPositive(intervention.globalDailyLimit, 'GLOBAL_AUTONOMOUS_POST_LIMIT_PER_DAY');
   assertPositive(intervention.maxMessageCharacters, 'CASSANDRA_MAX_MESSAGE_CHARACTERS');
+  assertPositive(intervention.attentionWindowDays, 'INTERVENTION_ATTENTION_WINDOW_DAYS');
 
   // ---- Memory (env overrides YAML overrides defaults) ----
   const mem = yaml.memory ?? {};

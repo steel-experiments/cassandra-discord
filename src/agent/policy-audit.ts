@@ -26,6 +26,15 @@ export interface EpisodePolicyDecisionAudit {
   forcedReview: { forceReview: boolean; rules: Array<{ rule: string; detail: string }> };
   cooldown: { allowed: boolean; blocks: Array<{ rule: string; retryAfterMs: number }> };
   duplicate: { matched: boolean; kind?: string; similarity?: number; source?: string };
+  /** Proactive attention admission (Section 12.7): bounded codes and windows only. */
+  attention: {
+    required: boolean;
+    eligible: boolean;
+    reason?: string;
+    revisionId?: string;
+    windowFromMs: number;
+    windowUntilMs: number;
+  };
   reasons: string[];
 }
 
@@ -67,6 +76,14 @@ export function buildEpisodePolicyDecision(
       ...(typeof duplicate.similarity === 'number' ? { similarity: finite(duplicate.similarity) } : {}),
       ...(typeof duplicate.source === 'string' ? { source: duplicate.source.slice(0, 80) } : {}),
     },
+    attention: {
+      required: input.attention.required === true,
+      eligible: input.attention.eligible !== false,
+      ...(typeof input.attention.reason === 'string' ? { reason: input.attention.reason.slice(0, 80) } : {}),
+      ...(typeof input.attention.revisionId === 'string' ? { revisionId: input.attention.revisionId.slice(0, 80) } : {}),
+      windowFromMs: finite(input.attention.windowFromMs),
+      windowUntilMs: finite(input.attention.windowUntilMs),
+    },
     reasons: strings(result.reasons),
   };
 }
@@ -76,18 +93,35 @@ export interface ScheduledPolicyDecisionAudit {
   notificationsAllowed: boolean; targetMatches: boolean;
   outboundSafety: { outcome: 'allow' | 'reject'; reasons: string[] };
   subjectValidation: { valid: boolean; blockingReasons: string[] };
+  /** Proactive attention admission (Section 12.7): bounded codes and windows only. */
+  attention: {
+    mode: string;
+    pinned: boolean;
+    eligible: boolean;
+    reason?: string;
+    revisionId?: string;
+    windowFromMs: number;
+    windowUntilMs: number;
+  };
   reasons: string[];
 }
 export function buildScheduledPolicyDecision(input: {
   mode: string; state: string; recommend: boolean; notificationsAllowed: boolean;
   targetMatches: boolean; outboundSafety: Safety; subjectBlockingReasons: readonly string[];
   reasons: readonly string[];
+  attention?: {
+    mode: string; pinned: boolean; eligible: boolean; reason?: string;
+    revisionId?: string; windowFromMs: number; windowUntilMs: number;
+  };
 }): ScheduledPolicyDecisionAudit {
   return {
     version: 1, kind: 'scheduled_notification', mode: input.mode.slice(0, 40), state: input.state.slice(0, 40),
     recommend: input.recommend, notificationsAllowed: input.notificationsAllowed, targetMatches: input.targetMatches,
     outboundSafety: { outcome: input.outboundSafety.outcome, reasons: strings(input.outboundSafety.reasons) },
     subjectValidation: { valid: input.subjectBlockingReasons.length === 0, blockingReasons: strings(input.subjectBlockingReasons) },
+    attention: input.attention ?? {
+      mode: '', pinned: false, eligible: true, windowFromMs: 0, windowUntilMs: 0,
+    },
     reasons: strings(input.reasons),
   };
 }

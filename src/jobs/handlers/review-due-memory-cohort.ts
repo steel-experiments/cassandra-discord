@@ -1,8 +1,11 @@
+// ABOUTME: One target-scoped scheduled cohort: validates the pinned attention
+// ABOUTME: revision before and after the model, then delegates to the runner.
 import type { DatabaseSync } from '../../db/database.js';
 import { getChannel } from '../../db/repositories/channels.js';
 import { fingerprintExposedMemory } from '../../agent/run-context.js';
 import type { DueMemoryCandidate } from '../../memory/due.js';
 import { getMemory } from '../../memory/repository.js';
+import { revisionHasUnconsumedEvent, validateRevisionEvidence } from '../../memory/attention-repository.js';
 import { recomputeMemoryScopes } from '../../memory/search.js';
 import {
   resolveScheduledMemoryRoute,
@@ -39,7 +42,10 @@ function currentCandidates(
   const out: DueMemoryCandidate[] = [];
   for (const subject of subjects) {
     const memory = getMemory(db, subject.memoryId);
-    if (!memory || memory.status !== 'active' || memory.review_after_ms === null || memory.review_after_ms > now) continue;
+    // Attention admission is independent of `review_after_ms`: a memory with
+    // no model review date can still have a current human development.
+    if (!memory || memory.status !== 'active') continue;
+    void now;
     const scope = scopes.get(memory.id);
     const count = countEvidence.get(memory.id) as { count: number } | undefined;
     out.push({
@@ -49,7 +55,7 @@ function currentCandidates(
       status: memory.status,
       confidence: memory.confidence,
       importance: memory.importance,
-      reviewAfterMs: memory.review_after_ms,
+      reviewAfterMs: memory.review_after_ms ?? memory.created_at_ms,
       lastConfirmedAtMs: memory.last_confirmed_at_ms,
       evidenceCount: Number(count?.count ?? 0),
       scopeType: scope?.scopeType ?? 'review_only',
@@ -65,33 +71,72 @@ export function createReviewDueMemoryCohortHandler(
 ): JobHandler<'review_due_memory_cohort'> {
   return async (payload: JobTypePayloadMap['review_due_memory_cohort'], job: JobRow) => {
     const routeOptions = (): ScheduledRouteOptions => deps.currentRouteOptions?.() ?? deps;
-    const subjectIsCurrent = (subject: ScheduledSubjectSnapshot): boolean => {
+    const releaseLeases = () => {
+      deps.db.prepare('DELETE FROM scheduled_review_cohort_subject_leases WHERE job_id = ?').run(job.id);
+    };
+    // A legacy payload without an explicit mode carries no revision identity
+    // and is not permission for registration: it fails closed.
+    if (payload.mode !== 'attention_review' && payload.mode !== 'attention_registration') {
+      releaseLeases();
+      return;
+    }
+    const subjectIsCurrent = (subject: ScheduledSubjectSnapshot & { attentionRevisionId?: string }): boolean => {
       const memory = getMemory(deps.db, subject.memoryId);
-      if (!memory || memory.status !== 'active' || memory.review_after_ms === null) return false;
+      if (!memory || memory.status !== 'active') return false;
       if (fingerprintExposedMemory(deps.db, subject.memoryId) !== subject.memoryFingerprint) return false;
       const route = resolveScheduledMemoryRoute(deps.db, subject.memoryId, routeOptions());
-      return route.kind === payload.routeKind && route.targetChannelId === payload.targetChannelId;
+      if (route.kind !== payload.routeKind || route.targetChannelId !== payload.targetChannelId) return false;
+      if (payload.mode === 'attention_review') {
+        // The pinned revision must still be current and unconsumed with a
+        // live trigger; window containment is rechecked by the runner's gate.
+        const pinned = subject.attentionRevisionId;
+        if (typeof pinned !== 'string' || pinned.length === 0) return false;
+        if (!validateRevisionEvidence(deps.db, pinned, deps.base.now?.() ?? Date.now())
+          || !revisionHasUnconsumedEvent(deps.db, pinned)) return false;
+      }
+      return true;
     };
     // A stale member has not influenced the model yet, so it may be dropped at
     // this boundary. After exposure the guard below is deliberately all-or-none.
-    const snapshots = payload.subjects.filter(subjectIsCurrent);
-    const snapshotValid = (): boolean => snapshots.every(subjectIsCurrent);
+    const snapshots = payload.subjects.filter((subject) =>
+      subjectIsCurrent(subject as ScheduledSubjectSnapshot & { attentionRevisionId?: string }));
+    const snapshotValid = (): boolean => payload.subjects.every((subject) =>
+      subjectIsCurrent(subject as ScheduledSubjectSnapshot & { attentionRevisionId?: string }));
     if (snapshots.length === 0) {
-      deps.db.prepare('DELETE FROM scheduled_review_cohort_subject_leases WHERE job_id = ?').run(job.id);
+      releaseLeases();
       return;
     }
     if (!snapshotValid()) {
-      deps.db.prepare('DELETE FROM scheduled_review_cohort_subject_leases WHERE job_id = ?').run(job.id);
+      releaseLeases();
       return;
     }
 
-    const resolvedScope = payload.routeKind === 'working'
+    const baseResolvedScope = payload.routeKind === 'working'
       ? deps.resolveWorkingScope(payload.targetChannelId)
       : deps.resolveSecureScope();
+    // A registration pass may persist validated revisions but never posts:
+    // its notification flag is always false.
+    const resolvedScope: ReviewScope = payload.mode === 'attention_registration'
+      ? { ...baseResolvedScope, notificationsAllowed: false }
+      : baseResolvedScope;
     const target = getChannel(deps.db, payload.targetChannelId);
     if (!target || resolvedScope.targetChannelId !== payload.targetChannelId) {
-      deps.db.prepare('DELETE FROM scheduled_review_cohort_subject_leases WHERE job_id = ?').run(job.id);
+      releaseLeases();
       return;
+    }
+
+    const attentionRevisions = new Map<string, { revisionId: string; windowFromMs: number; windowUntilMs: number }>();
+    if (payload.mode === 'attention_review') {
+      for (const subject of payload.subjects) {
+        const pinned = subject as { attentionRevisionId?: string; attentionWindowFromMs?: number; attentionWindowUntilMs?: number };
+        if (typeof pinned.attentionRevisionId === 'string') {
+          attentionRevisions.set(subject.memoryId, {
+            revisionId: pinned.attentionRevisionId,
+            windowFromMs: pinned.attentionWindowFromMs ?? 0,
+            windowUntilMs: pinned.attentionWindowUntilMs ?? 0,
+          });
+        }
+      }
     }
 
     const runner = createReviewDueMemoriesHandler({
@@ -101,8 +146,10 @@ export function createReviewDueMemoryCohortHandler(
       resolveReviewScope: () => resolvedScope,
       selectDue: (now) => currentCandidates(deps.db, snapshots, now),
       validateSnapshot: snapshotValid,
+      attentionMode: payload.mode,
+      attentionRevisions,
       validateNotificationSubjects: (subjects) => {
-        if (payload.routeKind !== 'working' || subjects.length === 0) return false;
+        if (payload.mode !== 'attention_review' || payload.routeKind !== 'working' || subjects.length === 0) return false;
         const route = resolveScheduledSubjectRoute(
           deps.db,
           subjects.map((subject) => subject.memoryId),
@@ -116,6 +163,6 @@ export function createReviewDueMemoryCohortHandler(
     if (outcome.kind === 'reviewed' && outcome.notification.routing.state === 'pending_review') {
       await deps.onPendingProposal?.(outcome);
     }
-    deps.db.prepare('DELETE FROM scheduled_review_cohort_subject_leases WHERE job_id = ?').run(job.id);
+    releaseLeases();
   };
 }

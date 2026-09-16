@@ -13,6 +13,16 @@ Cassandra first decides whether a proactive message is useful and adequately
 supported. Host code then validates its evidence, visibility, target, content,
 and routing policy. Only a proposal that passes those checks is eligible.
 
+Proactive speech also requires **current work**. Cassandra proposes an
+unsolicited message only when a meaningful human message about the subject was
+written within the last seven days — a new commitment, a changed decision, a
+reopened question, a specific outcome, or a contradiction of a stored decision —
+or when an explicit human-stated deadline on a subject becomes due. Each such
+human development earns at most one speaking opportunity, no matter how the
+attempt ended. An old promise with no new human development stays silent, and
+silence never deletes or invalidates the memory: it remains searchable, and an
+explicit question about it still gets a direct answer.
+
 The configured operating mode determines what happens next:
 
 | Mode | Eligible proactive proposal |
@@ -59,12 +69,14 @@ scheduled review` instead of a synthetic `Score: 1.00`.
 | Useful, supported proposal in `review` mode | Sent to the secure review channel for approval, including high-confidence proposals. |
 | Useful, supported, ordinary proposal in `autonomous` mode | Queued for target delivery after all host checks pass. |
 | Sensitive proposal or validation uncertainty in `autonomous` mode | Forced to the secure review channel. |
+| No recent human trigger or verified due deadline, or the revision's opportunity is already used | Suppressed in every mode, including review and forced-review cards, and stored as `observed`. |
+| An explicit human deadline becomes due on an unused subject | Eligible once inside the deadline window. |
 | Low score, low confidence, weak evidence, or no recommendation | Suppressed in every mode and stored as `observed`. |
 | Cooldown or recent duplicate during autonomous routing | Suppressed and stored as `observed`. |
 | Cooldown or recent duplicate discovered at approval time | Approval is blocked; a non-terminal block leaves the proposal pending for retry. |
 | Definite target, provenance, evidence, or visibility violation | Rejected from outbound routing and stored as `observed`; human approval cannot override it. |
 | Explicit direct question | Answered without proposal approval when enabled, but still subject to scope, evidence, mention-safety, and rate checks. |
-| Due scheduled-memory review | Proposed in the secure review channel in both `review` and `autonomous` modes; never sent autonomously. |
+| Subject revision eligible for scheduled review | Proposed in the secure review channel in both `review` and `autonomous` modes; never sent autonomously. |
 
 `observed` means "stored but not sent," not necessarily "Cassandra saw a message."
 It is intentionally broad so suppressed decisions remain auditable.
@@ -73,10 +85,14 @@ It is intentionally broad so suppressed decisions remain auditable.
 
 An approval is permission to attempt delivery; it is not permission to bypass
 safety controls. Cassandra verifies the administrator's role and rechecks the
-current target, evidence, visibility, cooldown, global limit, and duplicate state.
-It then atomically records the approval and reviewer and queues the outbox item plus
+current target, evidence, visibility, cooldown, global limit, duplicate state, and
+attention ownership — the proposal must still own its subject revision and be inside
+its attention window. It then atomically records the approval and reviewer and queues
+the outbox item plus
 its send job. The outbox worker publishes later, so `approved` means durably queued,
-not already visible in Discord.
+not already visible in Discord. An approved proposal whose attention window closes
+before the outbox runs is cancelled without sending; a send already proven delivered
+is recorded, never repeated or denied.
 
 The conversation may have changed since the card was created. A proposal remains
 `pending_review` until it is approved, dismissed, or expired. If a temporary or
@@ -86,7 +102,7 @@ controls. An approval click that detects expiry also resolves that card. Startup
 expires past-deadline rows in bounded, idempotent batches before interactions start, and
 periodic maintenance repeats the sweep as defense in depth. Expiry does not promise to edit
 an old Discord message; any stale button cannot enqueue delivery. Proposals expire after
-72 hours by default.
+72 hours by default, or sooner if their attention window closes.
 
 A definite privacy, evidence, or target violation cannot be overridden by an
 administrator. The proposal must be corrected or regenerated from permitted
@@ -101,10 +117,17 @@ run-exposed citations, current evidence checks, and the administrator's explicit
 
 ## Scheduled-memory reviews
 
-A scheduled-memory review asks whether an existing memory is still current or
-needs attention. It is intentionally reviewed by a human even in autonomous mode.
+A scheduled-memory review asks whether an existing memory received new human
+attention that is worth raising. It is intentionally reviewed by a human even in
+autonomous mode.
 Its card identifies the resolved channel, shows the recommendation reason, and
 includes up to three current host-generated evidence links.
+
+A scheduled review runs only when the subject has an eligible, unused attention
+revision — a recent material human development, or an explicit deadline that has
+become due. The review date on a memory is semantic bookkeeping; it never makes the
+memory eligible for a reminder by itself, and a reminder can never repeat without a
+new human development.
 
 The secure review channel is the approval inbox only. Cassandra derives one exact working
 channel from the memory's current origin evidence before the model runs. Approval queues
@@ -115,6 +138,25 @@ Cassandra performs silent secure maintenance or suppresses the notification.
 Use Discord's Reply action on the delivered working-channel message to provide an update.
 An exact reply can update or resolve the reviewed memory. Nearby text and ordinary messages
 in the review channel are not treated as feedback.
+
+## Upgrading from reminder-based releases
+
+An upgrade containing migrations `038_proactive_attention` and
+`039_deadline_decisions` changes which old work can resurface. First verify a
+completed [backup](../how-to/backup-and-restore.md); these are forward-only schema
+changes, so an older image cannot run against the upgraded database without a restore.
+Follow the [migration compatibility rules](../how-to/deploy.md#migration-compatibility).
+
+Before workers and interactions start, Cassandra records previously surfaced legacy
+evidence as consumed, expires legacy pending proposals, cancels their queued deliveries,
+and retires old scheduled-review jobs. Uncertain sends are reconciled with Discord
+instead of being blindly resent. The cutover itself performs no Discord or model calls
+and is safe to repeat after a restart. It does not erase memory or reactivate memories
+already expired by an older version.
+
+The old reminder interval and memory-age settings remain parseable but no longer
+control proactive admission or expire memories. The new attention window defaults to
+seven days; see [Intervention and memory settings](../reference/configuration.md#intervention-and-memory-settings).
 
 ## A useful mental model
 

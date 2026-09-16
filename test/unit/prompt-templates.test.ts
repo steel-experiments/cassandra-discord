@@ -150,6 +150,27 @@ describe('prompt templates compile and preserve safeguards', () => {
     expect(readPrompt(file).trimEnd()).toBe(promptBlock![1]);
   });
 
+  it.each(['episode-review.hbs', 'scheduled-review.hbs'])(
+    '%s permits only the verified, unconsumed deadline exception to current-work silence',
+    (file) => {
+      const hbs = renderEngine();
+      const out = compile(hbs, readPrompt(file))({
+        ...baseContext, episode, dueMemories,
+        asynchronousFollowups: [], scheduledNotificationFeedback: [],
+      });
+      expect(out).toContain('host-verified explicit human deadline');
+      expect(out).toMatch(/only time-based exception/);
+      expect(out).toMatch(/unconsumed revision/);
+      expect(out).toMatch(/Never infer deadline authority from `reviewAt` or a missing\s+completion record/);
+      if (file === 'episode-review.hbs') {
+        expect(out).toContain('intervention.trigger.kind = human_deadline');
+      } else {
+        expect(out).toContain('no verified deadline qualifies');
+        expect(out).toContain('notification.attentionRevisionId');
+      }
+    },
+  );
+
   it('templates compile under strict mode with only the allowlisted helpers', () => {
     const hbs = renderEngine();
     registerPartials(hbs);

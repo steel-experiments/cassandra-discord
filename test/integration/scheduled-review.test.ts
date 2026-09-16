@@ -2,8 +2,9 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createTestDb, seedIdentity, type TestDb } from '../helpers/db.js';
-import { upsertMessageCreate } from '../../src/db/repositories/messages.js';
+import { getMessage, upsertMessageCreate } from '../../src/db/repositories/messages.js';
 import { createMemory, getMemory, updateMemory } from '../../src/memory/repository.js';
+import { claimRevision, ensureSubjectForMember, registerRevision } from '../../src/memory/attention-repository.js';
 import { getProposal, insertProposal } from '../../src/db/repositories/proposals.js';
 import { enqueueOutbox, getOutboxByDedupeKey } from '../../src/outbox/repository.js';
 import type { RetrievalGrant } from '../../src/db/repositories/message-search.js';
@@ -226,6 +227,25 @@ function seedScheduledSubjectProposal(input: {
   return proposalId;
 }
 
+
+/** Post-cutover actionable scheduled proposals own an attention claim. */
+function seedAttentionClaim(proposalId: string, memoryId: string): string {
+  const subjectId = ensureSubjectForMember(env.db, { guildId: GUILD, memoryId, now: NOW });
+  const source = getMessage(env.db, 'm-due')!;
+  const { revisionId } = registerRevision(env.db, {
+    subjectId, now: NOW,
+    triggers: [{
+      messageId: source.id, createdAtMs: source.created_at_ms, content: source.content,
+      quoteStart: 0, quoteEnd: source.content.length,
+    }],
+  });
+  expect(claimRevision(env.db, {
+    revisionId, proposalId, consumedAtMs: NOW,
+    eligibleFromMs: source.created_at_ms, eligibleUntilMs: source.created_at_ms + 7 * 86_400_000,
+  })).toBe(true);
+  return revisionId;
+}
+
 function setRunProvenance(
   runId: string,
   messageIds: string[],
@@ -329,6 +349,8 @@ describe('routeScheduledNotification', () => {
 });
 
 describe('scheduled-review approval regression', () => {
+  // Rechecks assert each specific policy failure; legacy fixtures without an
+  // attention claim now expire instead of retaining retryable review controls.
   function approvalContext(): BootstrapContext {
     return {
       db: env.db,
@@ -372,8 +394,8 @@ describe('scheduled-review approval regression', () => {
       now: NOW,
     }, { db: env.db });
 
-    expect(result.outcome).toBe('policy_blocked');
-    expect(getProposal(env.db, proposalId)!.status).toBe('pending_review');
+    expect(result.outcome).toBe('expired');
+    expect(getProposal(env.db, proposalId)!.status).toBe('expired');
     expect(getOutboxByDedupeKey(env.db, `proposal:${proposalId}`)).toBeUndefined();
   });
 
@@ -394,6 +416,7 @@ describe('scheduled-review approval regression', () => {
       now: NOW,
     });
     insertScheduledProposalSubjects(env.db, proposalId, subjects, NOW);
+    seedAttentionClaim(proposalId, memoryId);
     const recheck = buildApprovalRecheck(approvalContext(), proposalId, NOW, {
       guildId: GUILD,
       reviewChannelId: REVIEW_CHANNEL,
@@ -431,6 +454,7 @@ describe('scheduled-review approval regression', () => {
       now: NOW,
     });
     insertScheduledProposalSubjects(env.db, proposalId, [subjectSnapshot(memoryId)], NOW);
+    seedAttentionClaim(proposalId, memoryId);
     const recheck = buildApprovalRecheck(approvalContext(), proposalId, NOW, {
       guildId: GUILD,
       reviewChannelId: REVIEW_CHANNEL,
@@ -468,6 +492,7 @@ describe('scheduled-review approval regression', () => {
       evidenceMessageIds: ['m-due'], expiresAtMs: NOW + 60_000, now: NOW,
     });
     insertScheduledProposalSubjects(env.db, proposalId, [subjectSnapshot(memoryId)], NOW);
+    seedAttentionClaim(proposalId, memoryId);
     const recheck = buildApprovalRecheck(approvalContext(), proposalId, NOW, {
       guildId: GUILD, reviewChannelId: REVIEW_CHANNEL,
       reviewAcceptedScopes: ['org', 'restricted', 'review_only'],
@@ -619,7 +644,7 @@ describe('scheduled-review approval regression', () => {
       recheck,
       now: NOW,
     }, { db: env.db });
-    expect(result.outcome).toBe('policy_blocked');
+    expect(result.outcome).toBe('expired');
     expect(getOutboxByDedupeKey(env.db, `proposal:${proposalId}`)).toBeUndefined();
   });
 
@@ -643,8 +668,8 @@ describe('scheduled-review approval regression', () => {
       recheck,
       now: NOW,
     }, { db: env.db });
-    expect(result.outcome).toBe('policy_blocked');
-    expect(getProposal(env.db, proposalId)!.status).toBe('pending_review');
+    expect(result.outcome).toBe('expired');
+    expect(getProposal(env.db, proposalId)!.status).toBe('expired');
     expect(getOutboxByDedupeKey(env.db, `proposal:${proposalId}`)).toBeUndefined();
   });
 

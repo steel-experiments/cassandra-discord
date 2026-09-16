@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createTestDb, seedIdentity, type TestDb } from '../helpers/db.js';
 import {
   routeProposal,
+  type AttentionRoutingInput,
   type ProposalRoutingInput,
   type ProposalThresholds,
   type ProposalEligibilityInputs,
@@ -55,6 +56,14 @@ const ELIGIBLE: ProposalEligibilityInputs = {
 const ALLOW_PROVENANCE: ProvenanceGateResult = { outcome: 'allow', reasons: [] };
 const ALLOW_OUTBOUND: OutboundEvidenceResult = { outcome: 'allow', reasons: [] };
 const NO_FORCED: ForcedReviewResult = { forceReview: false, rules: [] };
+/** An admitted attention revision (Section 12.7). */
+const ADMITTED_ATTENTION: AttentionRoutingInput = {
+  required: true,
+  eligible: true,
+  revisionId: 'rev-1',
+  windowFromMs: NOW - 1000,
+  windowUntilMs: NOW + 7 * 86_400_000,
+};
 const ALLOWED_COOLDOWN: CooldownDecision = { allowed: true, blocks: [], retryAfterMs: null };
 const NO_DUPLICATE: DuplicateResult = { matched: false };
 
@@ -96,6 +105,7 @@ function routingInput(over: Partial<ProposalRoutingInput> = {}): ProposalRouting
     forcedReview: NO_FORCED,
     cooldown: ALLOWED_COOLDOWN,
     duplicate: NO_DUPLICATE,
+    attention: ADMITTED_ATTENTION,
     ...over,
   };
 }
@@ -325,5 +335,48 @@ describe('insertProposal / getProposal — persists the routed state', () => {
     expect(stored.status).toBe('observed');
     expect(stored.reason).toContain('did not recommend');
     expect(stored.message).toBeNull();
+  });
+});
+
+describe('routeProposal — proactive attention gate — Section 12.7', () => {
+  const DENIED: AttentionRoutingInput = {
+    required: true,
+    eligible: false,
+    reason: 'no_recent_human_trigger',
+  };
+
+  it('suppresses an ineligible recommendation to observed in review mode', () => {
+    const result = routeProposal(routingInput({ mode: 'review', attention: DENIED }));
+    expect(result.state).toBe('observed');
+    expect(result.reasons.some((r) => r.includes('attention gate (no_recent_human_trigger)'))).toBe(true);
+  });
+
+  it('suppresses an ineligible recommendation before forced-review routing', () => {
+    const result = routeProposal(routingInput({
+      forcedReview: FORCED_REVIEW,
+      attention: DENIED,
+    }));
+    expect(result.state).toBe('observed');
+    expect(result.reasons.some((r) => r.includes('attention gate'))).toBe(true);
+  });
+
+  it('suppresses an ineligible recommendation despite an allowed cooldown and no duplicate', () => {
+    const result = routeProposal(routingInput({ attention: DENIED }));
+    expect(result.state).toBe('observed');
+  });
+
+  it('does not gate proposals that carry no attention requirement', () => {
+    const result = routeProposal(routingInput({
+      attention: { required: false, eligible: true },
+    }));
+    expect(result.state).toBe('approved');
+  });
+
+  it('a consumed revision is suppressed with its own reason code', () => {
+    const result = routeProposal(routingInput({
+      attention: { required: true, eligible: false, reason: 'revision_consumed' },
+    }));
+    expect(result.state).toBe('observed');
+    expect(result.reasons.some((r) => r.includes('revision_consumed'))).toBe(true);
   });
 });

@@ -101,7 +101,7 @@ describe('periodic maintenance cycle', () => {
 
     const repair = await runPeriodicMaintenanceCycle({
       expireProposals: async () => { order.push('expiry'); },
-      expireStaleMemories: () => { order.push('stale-memories'); return { expiredIds: [] }; },
+      expireAttention: () => { order.push('attention'); return { expiredRevisionIds: [] }; },
       maintainDatabase: async () => { order.push('database'); },
       repairDeepRecaps: () => {
         order.push('deep-recaps');
@@ -115,7 +115,7 @@ describe('periodic maintenance cycle', () => {
       logger: { info, warn },
     });
 
-    expect(order).toEqual(['expiry', 'stale-memories', 'database', 'deep-recaps']);
+    expect(order).toEqual(['expiry', 'attention', 'database', 'deep-recaps']);
     expect(repair).toEqual({
       jobsEnqueued: 1,
       chunksReset: 1,

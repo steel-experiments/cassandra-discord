@@ -21,6 +21,7 @@ import { getProposal, setProposalMessage, setProposalReviewed, setProposalStatus
 import { recordAdminEvent } from '../db/repositories/admin-events.js';
 import { authorizeAdmin, type AuthorizationOutcome } from '../discord/authorization.js';
 import { enqueueOutbox } from '../outbox/repository.js';
+import { enqueueProposalDeliverySync } from '../outbox/proposal-delivery.js';
 import type { OutboundEvidenceResult, ProvenanceGateResult } from '../agent/policy.js';
 import type { CooldownDecision } from '../agent/cooldowns.js';
 import type { DuplicateResult } from '../agent/duplicate-policy.js';
@@ -45,6 +46,14 @@ export interface ApprovalPolicyRecheck {
   scheduledDelivery?: { allow: boolean; reasons: string[]; deliveryContent?: string };
   /** Recompute scheduled delivery while the approval transaction owns the write lock. */
   revalidateScheduledDelivery?: () => { allow: boolean; reasons: string[]; deliveryContent?: string };
+  /**
+   * Attention ownership and window check (Section 12.7). The SAME proposal must
+   * own its revision claim inside the immutable window; a definite failure
+   * expires the proposal rather than blocking it for retry.
+   */
+  attention?: { allow: boolean; reasons: string[] };
+  /** Recompute attention ownership while the approval transaction owns the write lock. */
+  revalidateAttention?: () => { allow: boolean; reasons: string[] };
 }
 
 /**
@@ -76,6 +85,9 @@ export function recheckApprovalPolicy(input: ApprovalPolicyRecheck): {
     reasons.push(
       `${input.duplicate.kind} duplicate of a recent ${input.duplicate.source} message (similarity ${input.duplicate.similarity.toFixed(3)})`,
     );
+  }
+  if (input.attention && !input.attention.allow) {
+    reasons.push(...input.attention.reasons);
   }
   return { allow: reasons.length === 0, reasons };
 }
@@ -214,6 +226,17 @@ export async function approveProposal(
   // Re-run the current policy (Section 25 steps 2-3). A change since routing can
   // block the send without discarding the proposal (it stays pending_review).
   const recheck = recheckApprovalPolicy(input.recheck);
+  if (input.recheck.attention && !input.recheck.attention.allow) {
+    const reasons = input.recheck.attention.reasons;
+    transactionImmediate(deps.db, () => {
+      setProposalStatus(deps.db, input.proposalId, 'expired', input.now);
+      enqueueProposalDeliverySync(deps.db, input.proposalId, input.now);
+      auditApproval(deps.db, input, 'expired', reasons, authorization);
+    });
+    await resolveReviewSafely(deps, proposal.reviewMessageId,
+      `⏰ Expired: ${reasons[0] ?? 'attention authority changed'}`);
+    return { outcome: 'expired', proposalId: input.proposalId, reasons, authorization };
+  }
   if (input.recheck.scheduledDelivery && !input.recheck.scheduledDelivery.allow) {
     setProposalStatus(deps.db, input.proposalId, 'expired', input.now);
     const reasons = input.recheck.scheduledDelivery.reasons;
@@ -255,6 +278,18 @@ export async function approveProposal(
   let scheduledBlockReason: string | null = null;
   let scheduledBlockExpired = false;
   transactionImmediate(deps.db, () => {
+    // Attention ownership is rechecked under the write lock: the SAME proposal
+    // must own its revision inside the immutable window. A definite failure is
+    // terminal — the card expires instead of blocking for retry.
+    const currentAttention = input.recheck.revalidateAttention?.();
+    if (currentAttention && !currentAttention.allow) {
+      scheduledBlockReason = currentAttention.reasons[0] ?? 'attention authority changed';
+      scheduledBlockExpired = true;
+      setProposalStatus(deps.db, input.proposalId, 'expired', input.now);
+      auditApproval(deps.db, input, 'expired', currentAttention.reasons, authorization);
+      enqueueProposalDeliverySync(deps.db, input.proposalId, input.now);
+      return;
+    }
     const currentScheduledDelivery = input.recheck.revalidateScheduledDelivery?.();
     if (currentScheduledDelivery && !currentScheduledDelivery.allow) {
       scheduledBlockReason = currentScheduledDelivery.reasons[0] ?? 'scheduled delivery route changed';

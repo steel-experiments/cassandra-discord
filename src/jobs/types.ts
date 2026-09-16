@@ -51,7 +51,16 @@ export interface JobTypePayloadMap {
   review_due_memory_cohort: {
     routeKind: 'working' | 'secure_maintenance';
     targetChannelId: string;
-    subjects: Array<{ memoryId: string; memoryFingerprint: string }>;
+    /** Attention cohort mode (Section 12.7). Legacy payloads without a mode are invalidated at cutover. */
+    mode?: 'attention_review' | 'attention_registration';
+    subjects: Array<{
+      memoryId: string;
+      memoryFingerprint: string;
+      /** Pinned revision for attention_review cohorts. */
+      attentionRevisionId?: string;
+      attentionWindowFromMs?: number;
+      attentionWindowUntilMs?: number;
+    }>;
   };
   send_outbox: { outboxId: string };
   sync_proposal_review: { proposalId: string };
@@ -133,6 +142,13 @@ export function validateJobPayload<T extends JobType>(
     if (typeof value.targetChannelId !== 'string' || value.targetChannelId.trim().length === 0) {
       throw new Error('job payload for review_due_memory_cohort missing targetChannelId');
     }
+    if (
+      value.mode !== undefined
+      && value.mode !== 'attention_review'
+      && value.mode !== 'attention_registration'
+    ) {
+      throw new Error('job payload for review_due_memory_cohort has invalid mode');
+    }
     if (!Array.isArray(value.subjects) || value.subjects.length === 0 || value.subjects.length > 20) {
       throw new Error('job payload for review_due_memory_cohort requires 1 to 20 subjects');
     }
@@ -141,6 +157,18 @@ export function validateJobPayload<T extends JobType>(
       if (!subject || typeof subject.memoryId !== 'string' || subject.memoryId.trim().length === 0
         || typeof subject.memoryFingerprint !== 'string' || subject.memoryFingerprint.trim().length === 0) {
         throw new Error('job payload for review_due_memory_cohort has malformed subject');
+      }
+      // An attention_review cohort requires a pinned revision on every
+      // subject; a registration cohort never carries one. A missing mode is
+      // not permission for either shape.
+      if (value.mode === 'attention_review') {
+        if (typeof subject.attentionRevisionId !== 'string' || subject.attentionRevisionId.length === 0) {
+          throw new Error('job payload for attention_review cohort missing attentionRevisionId');
+        }
+      } else if (value.mode === 'attention_registration') {
+        if (subject.attentionRevisionId !== undefined) {
+          throw new Error('job payload for attention_registration cohort must not pin a revision');
+        }
       }
       if (ids.has(subject.memoryId)) {
         throw new Error('job payload for review_due_memory_cohort has duplicate subjects');

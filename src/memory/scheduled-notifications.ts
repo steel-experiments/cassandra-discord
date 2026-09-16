@@ -30,6 +30,12 @@ export function resolveScheduledSubjects(
     proposedSubjectMemoryIds: readonly unknown[];
     citedMessageIds: ReadonlySet<string>;
     now: number;
+    /**
+     * Host-verified trigger evidence of the cohort's pinned attention revision
+     * (Section 12.7). A citation of the trigger proves the subject relation the
+     * same way stored memory evidence does.
+     */
+    acceptedTriggerMessageIds?: ReadonlySet<string>;
   },
 ): ResolveScheduledSubjectsResult {
   const blockingReasons: string[] = [];
@@ -61,18 +67,18 @@ export function resolveScheduledSubjects(
       blockingReasons.push('notification subject was not due and exposed in this run');
       continue;
     }
+    // Attention admission is independent of `review_after_ms` (Section 12.7):
+    // the cohort's due set is the authority, and the memory only has to remain
+    // active and fingerprintable.
     const memory = getMemory(db, memoryId);
-    if (
-      !memory
-      || memory.status !== 'active'
-      || memory.review_after_ms === null
-      || memory.review_after_ms > input.now
-    ) {
+    if (!memory || memory.status !== 'active') {
       blockingReasons.push('notification subject is no longer due');
       continue;
     }
     const hasCitedEvidence = (evidence.all(memoryId) as Array<{ message_id: string }>).some(
       (row) => input.citedMessageIds.has(row.message_id),
+    ) || [...(input.acceptedTriggerMessageIds ?? [])].some(
+      (messageId) => input.citedMessageIds.has(messageId),
     );
     if (!hasCitedEvidence) {
       blockingReasons.push('notification subject is not supported by its cited evidence');
@@ -268,13 +274,10 @@ export function findScheduledApprovalSubjectBlock(
 ): ScheduledSubjectBlock {
   const subjects = getScheduledProposalSubjects(db, proposalId);
   for (const subject of subjects) {
+    // Admission no longer depends on `review_after_ms` (Section 12.7): the
+    // attention claim owns the window; the subject must merely stay active.
     const memory = getMemory(db, subject.memoryId);
-    if (
-      !memory
-      || memory.status !== 'active'
-      || memory.review_after_ms === null
-      || memory.review_after_ms > now
-    ) {
+    if (!memory || memory.status !== 'active') {
       return {
         blocked: true,
         reason: 'scheduled subject is no longer due',

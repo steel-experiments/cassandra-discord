@@ -126,7 +126,7 @@ export function validateScheduledProposalDelivery(
   db: DatabaseSync,
   proposalId: string,
   options: ScheduledRouteOptions,
-  now: number,
+  _now: number,
 ): ScheduledDeliveryCheck {
   const proposal = getProposal(db, proposalId);
   if (!proposal) return { scheduled: false, allow: false, reasons: ['proposal not found'], memoryIds: [] };
@@ -144,7 +144,9 @@ export function validateScheduledProposalDelivery(
   }
   for (const subject of subjects) {
     const memory = getMemory(db, subject.memoryId);
-    if (!memory || memory.status !== 'active' || memory.review_after_ms === null || memory.review_after_ms > now) {
+    // Admission no longer depends on `review_after_ms` (Section 12.7): the
+    // attention claim owns the window; the subject must merely stay active.
+    if (!memory || memory.status !== 'active') {
       reasons.push('scheduled subject is no longer due');
       continue;
     }

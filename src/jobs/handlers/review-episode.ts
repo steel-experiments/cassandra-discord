@@ -36,7 +36,11 @@ import {
 } from '../../agent/episode-comparison.js';
 import type { Logger } from '../../logger.js';
 import { computeInterventionScore, type InterventionDimensions } from '../../agent/policy.js';
-import { applyMemoryProposals, type AgentMemoryProposal } from '../../agent/memory-policy.js';
+import {
+  applyMemoryProposals,
+  type AgentMemoryProposal,
+  type ApplyMemoryProposalsResult,
+} from '../../agent/memory-policy.js';
 import { insertProposal } from '../../db/repositories/proposals.js';
 import { unavailablePolicyDecision } from '../../agent/policy-audit.js';
 import type { JobHandler } from '../worker.js';
@@ -130,6 +134,10 @@ export interface ReviewEpisodeHandlerDeps {
   episodeShadow?: EpisodeShadowOptions;
   memoryMinimumConfidence?: number;
   memoryMinimumImportance?: number;
+  /** Proactive attention window (Section 12.7; default seven days). */
+  attentionWindowMs?: number;
+  /** Organization timezone captured with accepted deadline authority. */
+  attentionTimezone?: string;
   /** Bounded same-conversation look-ahead for asynchronous follow-ups. */
   memoryFollowupHorizonDays?: number;
   memoryFollowupMaxMessages?: number;
@@ -140,6 +148,10 @@ export interface ReviewEpisodeHandlerDeps {
     episode: EpisodeRow;
     scope: ChannelScope;
     now: number;
+    /** Resolved memory-mutation outcomes, including the index-to-memoryId mapping. */
+    memoryOutcome: ApplyMemoryProposalsResult;
+    /** Message IDs of the episode payload and its bounded follow-ups only. */
+    episodeMessageIds: ReadonlySet<string>;
   }) => string | undefined | Promise<string | undefined>;
   logger?: Pick<Logger, 'info' | 'warn'>;
 }
@@ -613,9 +625,23 @@ export function createReviewEpisodeHandler(
           exposedMemoryIds,
           minimumConfidence: deps.memoryMinimumConfidence,
           minimumImportance: deps.memoryMinimumImportance,
+          attentionWindowMs: deps.attentionWindowMs,
+          attentionTimezone: deps.attentionTimezone,
+          cassandraId: deps.cassandraId,
           logger: deps.logger,
         }, Array.isArray(proposal.memoryProposals) ? proposal.memoryProposals : []);
-        interventionProposalId = await deps.routeIntervention?.({ proposal, result, episode, scope, now });
+        interventionProposalId = await deps.routeIntervention?.({
+          proposal,
+          result,
+          episode,
+          scope,
+          now,
+          memoryOutcome: memory,
+          episodeMessageIds: new Set([
+            ...transcript.payloadMessages.map((message) => message.id),
+            ...followups.map((message) => message.id),
+          ]),
+        });
         const runPersisted = Boolean(db.prepare('SELECT 1 FROM agent_runs WHERE id = ?').get(result.runId));
         if (!interventionProposalId && proposal.intervention && runPersisted) {
           interventionProposalId = insertProposal(db, {
@@ -732,6 +758,18 @@ export interface EpisodeReviewProposalShape {
     replyToMessageId?: string;
     evidenceMessageIds?: string[];
     message?: string;
+    subject?: {
+      kind?: string;
+      memoryId?: string;
+      proposalIndex?: number;
+    };
+    trigger?: {
+      kind?: string;
+      evidence?: Array<{ messageId?: string; quote?: string }>;
+      relation?: string;
+      materialChange?: string;
+      revisionId?: string;
+    };
   };
 }
 

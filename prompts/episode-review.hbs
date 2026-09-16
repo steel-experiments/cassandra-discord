@@ -13,6 +13,18 @@ listed current subjects. The human reply is new evidence. The Cassandra notifica
 and old memory statement are context only and do not prove a postponement, completion,
 or other status change.
 
+Proactive speech needs current work. When you recommend an intervention, identify
+the subject memory in `intervention.subject` and the triggering human development in
+`intervention.trigger`: quote up to three recent episode or follow-up messages in
+which a human made a new commitment, changed a decision, reopened a question,
+reported a specific outcome, or contradicted a stored record. Older memories and
+retrieved history may support the message as context; they are not new human triggers.
+A host-verified explicit human deadline is the only time-based exception: it may
+justify one intervention when it becomes due on an unconsumed revision. Use
+`intervention.trigger.kind = human_deadline`; the host resolves and validates the
+deadline. Never infer deadline authority from `reviewAt` or a missing completion record.
+Otherwise, silence is correct when the only change is that time passed.
+
 Perform the following:
 
 1. Determine whether the episode contains a consequential decision, assumption,
@@ -38,6 +50,8 @@ Perform the following:
    Use `project` or `organizational` only when the information will change a
    future decision or prevent repeated work after the conversation scrolls away.
 7. Evaluate whether an intervention would create more value than interruption.
+   Recommend one only with a current trigger: without a valid subject and trigger
+   the host stores the proposal silently, whatever its score.
 8. If intervention is warranted, draft one concise message suitable for the target
    channel. It must stand on permitted evidence and include no unsupported accusations.
 9. Finish by calling `finalize_episode_review` exactly once.

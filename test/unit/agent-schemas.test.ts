@@ -167,4 +167,106 @@ describe('agent schemas', () => {
     expect(r.ok).toBe(false);
     expect(r.errors.every((e) => typeof e.path === 'string' && typeof e.message === 'string')).toBe(true);
   });
+
+  it('accepts optional attention subject, trigger, and revision echo (Section 12.7)', () => {
+    const withSubject = validEpisodeReview();
+    const intervention = withSubject.intervention as unknown as Record<string, unknown>;
+    intervention.subject = { kind: 'memory_proposal', proposalIndex: 0 };
+    intervention.trigger = {
+      kind: 'new_human_evidence',
+      evidence: [{ messageId: '111', quote: 'adopted' }],
+      relation: 'new_commitment',
+      materialChange: 'The team committed to the trial.',
+    };
+    expect(validate(FinalizeEpisodeReview, withSubject).ok).toBe(true);
+
+    const deadlineTrigger = validEpisodeReview();
+    (deadlineTrigger.intervention as unknown as Record<string, unknown>).trigger = {
+      kind: 'human_deadline',
+      revisionId: 'rev-1',
+    };
+    expect(validate(FinalizeEpisodeReview, deadlineTrigger).ok).toBe(true);
+
+    const noneTrigger = validEpisodeReview();
+    (noneTrigger.intervention as unknown as Record<string, unknown>).trigger = { kind: 'none' };
+    expect(validate(FinalizeEpisodeReview, noneTrigger).ok).toBe(true);
+
+    const scheduled = {
+      memoryProposals: [],
+      notification: {
+        recommend: true,
+        reason: 'current change',
+        targetChannelId: '999',
+        message: 'text',
+        evidenceMessageIds: ['111'],
+        subjectMemoryIds: ['m1'],
+        attentionRevisionId: 'rev-1',
+      },
+    };
+    expect(validate(FinalizeScheduledReview, scheduled).ok).toBe(true);
+  });
+
+  it('rejects malformed attention subject and trigger declarations', () => {
+    const badSubject = validEpisodeReview();
+    (badSubject.intervention as unknown as Record<string, unknown>).subject = {
+      kind: 'existing_memory',
+      memoryId: '',
+    };
+    expect(validate(FinalizeEpisodeReview, badSubject).ok).toBe(false);
+
+    const badTrigger = validEpisodeReview();
+    (badTrigger.intervention as unknown as Record<string, unknown>).trigger = {
+      kind: 'new_human_evidence',
+      evidence: [],
+      relation: 'somehow_relevant',
+      materialChange: 'x',
+    };
+    const r = validate(FinalizeEpisodeReview, badTrigger);
+    expect(r.ok).toBe(false);
+    expect(r.errors.some((e) => e.path.includes('trigger'))).toBe(true);
+
+    const outOfRange = validEpisodeReview();
+    (outOfRange.intervention as unknown as Record<string, unknown>).subject = {
+      kind: 'memory_proposal',
+      proposalIndex: 20,
+    };
+    expect(validate(FinalizeEpisodeReview, outOfRange).ok).toBe(false);
+  });
+
+  it('accepts optional attentionChange and deadlineChange on memory proposals', () => {
+    const withChanges = validEpisodeReview();
+    const proposal = withChanges.memoryProposals[0] as unknown as Record<string, unknown>;
+    proposal.attentionChange = {
+      evidence: [{ messageId: '111', quote: 'adopted' }],
+      relation: 'new_commitment',
+      materialChange: 'The team committed to the trial.',
+    };
+    proposal.deadlineChange = {
+      action: 'set',
+      sourceMessageId: '111',
+      quote: 'adopted by Friday',
+      dateExpression: 'Friday',
+      proposedAt: '2026-09-18T00:00:00Z',
+    };
+    expect(validate(FinalizeEpisodeReview, withChanges).ok).toBe(true);
+
+    const badDeadline = validEpisodeReview();
+    (badDeadline.memoryProposals[0] as unknown as Record<string, unknown>).deadlineChange = {
+      action: 'set',
+      sourceMessageId: '111',
+      quote: 'adopted by Friday',
+      dateExpression: 'whenever it lands',
+    };
+    const r = validate(FinalizeEpisodeReview, badDeadline);
+    expect(r.ok).toBe(true); // grammar rejection is host-side, not structural
+    expect(badDeadline).toBeDefined();
+
+    const clearForm = validEpisodeReview();
+    (clearForm.memoryProposals[0] as unknown as Record<string, unknown>).deadlineChange = {
+      action: 'clear',
+      sourceMessageId: '111',
+      quote: 'the deadline is cancelled',
+    };
+    expect(validate(FinalizeEpisodeReview, clearForm).ok).toBe(true);
+  });
 });

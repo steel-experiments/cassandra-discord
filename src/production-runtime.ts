@@ -12,6 +12,24 @@ import { getMessage } from './db/repositories/messages.js';
 import { getMemory } from './memory/repository.js';
 import { recomputeMemoryScopes } from './memory/search.js';
 import {
+  evaluateRevisionAdmission,
+  isNewerThanFrontier,
+  type AttentionRejectionReason,
+} from './memory/attention.js';
+import {
+  claimRevision,
+  ensureSubjectForMember,
+  findConsumedTriggerMessageIds,
+  getClaim,
+  getRevision,
+  getSubjectConsumedFrontier,
+  listSubjectRevisions,
+  registerRevision,
+  validateProposalAttention,
+  validateRevisionEvidence,
+  validateTriggerEvidence,
+} from './memory/attention-repository.js';
+import {
   DEFAULT_SCHEDULED_REMINDER_INTERVAL_MS,
   getScheduledProposalSubjects,
 } from './memory/scheduled-notifications.js';
@@ -32,6 +50,7 @@ import { createCloseEpisodeHandler } from './jobs/handlers/close-episode.js';
 import { createDirectAnswerHandler } from './jobs/handlers/direct-answer.js';
 import { createDeepRecapHandler } from './jobs/handlers/deep-recap.js';
 import { createReviewEpisodeHandler } from './jobs/handlers/review-episode.js';
+import type { ApplyMemoryProposalsResult } from './agent/memory-policy.js';
 import {
   type ReviewScope,
 } from './jobs/handlers/review-due-memories.js';
@@ -46,7 +65,8 @@ import { createBackupDatabaseHandler } from './jobs/handlers/backup-database.js'
 import { createDatabaseMaintenanceHandler } from './jobs/handlers/maintenance.js';
 import { createExpireProposalsHandler } from './jobs/handlers/expire-proposals.js';
 import { createRescopeMemoriesHandler } from './jobs/handlers/rescope-memories.js';
-import { expireStaleMemories, type ExpireStaleMemoriesResult } from './memory/maintenance.js';
+import { expireClosedAttentionRevisions, type ExpireAttentionResult } from './memory/attention-repository.js';
+import { runAttentionCutover, type AttentionCutoverReport } from './memory/attention-cutover.js';
 import { createForgetUserHandler } from './jobs/handlers/forget-user.js';
 import { createArchiveAttachmentHandler } from './jobs/handlers/archive-attachment.js';
 import { createPurgeAttachmentFileHandler } from './jobs/handlers/purge-attachment-file.js';
@@ -74,6 +94,7 @@ import {
   resolveProvenanceScopes,
   routeProposal,
   validateOutboundEvidence,
+  type AttentionRoutingInput,
   type ProvenanceGateResult,
   type ProvenanceScopeEntry,
 } from './agent/policy.js';
@@ -101,7 +122,7 @@ import {
 import { loadDocsIndex } from './agent/docs-index.js';
 import { DeferJobError, PermanentJobError, TransientJobError } from './jobs/errors.js';
 import type { BootstrapContext, DiscordWiring, JobRuntimeWiring } from './bootstrap.js';
-import { transaction, type DatabaseSync } from './db/database.js';
+import { transactionImmediate, type DatabaseSync } from './db/database.js';
 import {
   repairDeepRecapOwnership,
   repairDurableWork,
@@ -161,8 +182,8 @@ export function lastScheduledRunMs(db: DatabaseSync, key: string, match: 'exact'
 
 export interface PeriodicMaintenanceCycleDeps {
   expireProposals: () => Promise<unknown>;
-  /** Staleness-horizon sweep for long-overdue memories (Section 12.4). */
-  expireStaleMemories: () => ExpireStaleMemoriesResult;
+  /** Closed-window sweep for unconsumed attention revisions (Section 12.7). */
+  expireAttention: () => ExpireAttentionResult;
   maintainDatabase: () => Promise<unknown>;
   repairDeepRecaps: () => DeepRecapOwnershipRepairReport;
   logger: Pick<BootstrapContext['logger'], 'info'>
@@ -174,11 +195,11 @@ export async function runPeriodicMaintenanceCycle(
   deps: PeriodicMaintenanceCycleDeps,
 ): Promise<DeepRecapOwnershipRepairReport> {
   await deps.expireProposals();
-  const staleSweep = deps.expireStaleMemories();
-  if (staleSweep.expiredIds.length > 0) {
+  const attentionSweep = deps.expireAttention();
+  if (attentionSweep.expiredRevisionIds.length > 0) {
     deps.logger.info(
-      { event: 'memories.staleness_expired', count: staleSweep.expiredIds.length, ids: staleSweep.expiredIds },
-      'expired memories past the staleness horizon',
+      { event: 'attention.window_expired', count: attentionSweep.expiredRevisionIds.length },
+      'expired attention revisions whose supported windows closed',
     );
   }
   await deps.maintainDatabase();
@@ -508,6 +529,10 @@ export function buildApprovalRecheck(
     visibility: currentTarget?.visibility ?? 'excluded',
     isSecureReview: proposal.targetChannelId === ctx.config.reviewChannelId };
   const evidenceMessageIds = [...new Set(proposal.evidenceMessageIds)];
+  // Attention ownership: the SAME proposal must own its revision claim inside
+  // the immutable window (Section 12.7). Recomputed under the approval write
+  // lock by the closure below.
+  const attention = validateProposalAttention(ctx.db, proposalId, now);
   let provenance: ApprovalPolicyRecheck['provenance'];
   let runType: string | undefined;
   let runGuildId: string | undefined;
@@ -629,6 +654,10 @@ export function buildApprovalRecheck(
     revalidateScheduledDelivery: scheduledDelivery
       ? () => checkScheduledDelivery() ?? { allow: true, reasons: [] }
       : undefined,
+    attention,
+    revalidateAttention: attention.attention
+      ? () => validateProposalAttention(ctx.db, proposalId, now)
+      : undefined,
   };
 }
 
@@ -655,6 +684,159 @@ export function buildScheduledReviewPresentation(
     proposedMessage: rendered.outcome === 'allow' ? rendered.content : (proposal.message ?? ''),
     sources: [],
     expiresAtMs: proposal.expiresAtMs,
+  };
+}
+
+/**
+ * Resolve the attention admission of one episode intervention (Section 12.7).
+ * The subject is resolved through the accepted memory-outcome mapping — never a
+ * model-guessed UUID — and the trigger evidence must be episode or follow-up
+ * material that the run exposed. The revision is registered idempotently; the
+ * claim happens later, inside the proposal-persistence transaction.
+ */
+function computeEpisodeAttentionAdmission(
+  ctx: BootstrapContext,
+  input: {
+    intervention: NonNullable<Parameters<NonNullable<Parameters<typeof createReviewEpisodeHandler>[0]['routeIntervention']>>[0]['proposal']['intervention']>;
+    memoryOutcome: ApplyMemoryProposalsResult;
+    episodeMessageIds: ReadonlySet<string>;
+    exposedMessageIds: ReadonlySet<string>;
+    exposedMemoryIds: ReadonlySet<string>;
+    now: number;
+  },
+): AttentionRoutingInput {
+  const windowMs = ctx.config.intervention.attentionWindowDays * 86_400_000;
+  const intervention = input.intervention;
+  if (intervention?.recommend !== true) {
+    // Attention is only consulted for recommendations; silence needs no gate.
+    return { required: false, eligible: true };
+  }
+
+  const fail = (reason: AttentionRejectionReason): AttentionRoutingInput => ({
+    required: true, eligible: false, reason,
+  });
+
+  // Subject: an existing memory the run exposed, or an accepted proposal index.
+  const subject = intervention.subject;
+  let subjectMemoryId: string | undefined;
+  if (subject?.kind === 'existing_memory' && typeof subject.memoryId === 'string') {
+    const memory = getMemory(ctx.db, subject.memoryId);
+    if (
+      !memory
+      || memory.guild_id !== ctx.config.discord.guildId
+      || (!input.exposedMemoryIds.has(subject.memoryId)
+        && !input.memoryOutcome.applied.some((o) => o.memoryId === subject.memoryId))
+    ) {
+      return fail('attention_authority_missing');
+    }
+    subjectMemoryId = subject.memoryId;
+  } else if (subject?.kind === 'memory_proposal' && typeof subject.proposalIndex === 'number') {
+    const applied = input.memoryOutcome.applied.find(
+      (o) => o.index === subject.proposalIndex && o.accepted && typeof o.memoryId === 'string',
+    );
+    if (!applied?.memoryId) return fail('attention_authority_missing');
+    subjectMemoryId = applied.memoryId;
+  } else {
+    return fail('attention_authority_missing');
+  }
+
+  const trigger = intervention.trigger;
+  if (!trigger || trigger.kind === 'none') {
+    return fail('no_recent_human_trigger');
+  }
+
+  const subjectId = ensureSubjectForMember(ctx.db, {
+    guildId: ctx.config.discord.guildId, memoryId: subjectMemoryId, now: input.now,
+  });
+
+  if (trigger.kind === 'human_deadline') {
+    // The model cannot know host-assigned revision ids in an episode run, so
+    // the host resolves the subject's due-deadline revision itself; a model
+    // echo, when present, must still name a revision of this subject.
+    const echoed = typeof trigger.revisionId === 'string' ? getRevision(ctx.db, trigger.revisionId) : null;
+    if (echoed !== null && echoed.subjectId !== subjectId) {
+      return fail('attention_authority_missing');
+    }
+    const revision = echoed ?? listSubjectRevisions(ctx.db, subjectId).find((candidate) => {
+      if (candidate.state !== 'current' || candidate.explicitDeadlineAtMs === null) return false;
+      if (getClaim(ctx.db, candidate.id) !== null) return false;
+      return candidate.explicitDeadlineAtMs <= input.now
+        && input.now <= candidate.explicitDeadlineAtMs + windowMs;
+    }) ?? null;
+    if (!revision) {
+      return fail('deadline_unverified');
+    }
+    if (!validateRevisionEvidence(ctx.db, revision.id, input.now)) return fail('trigger_changed');
+    const verdict = evaluateRevisionAdmission(
+      {
+        revisionId: revision.id, subjectId: revision.subjectId, state: revision.state,
+        humanEventAtMs: revision.humanEventAtMs, explicitDeadlineAtMs: revision.explicitDeadlineAtMs,
+      },
+      getClaim(ctx.db, revision.id),
+      input.now,
+      windowMs,
+    );
+    if (!verdict.eligible) return fail(verdict.reason);
+    return {
+      required: true, eligible: true, revisionId: revision.id,
+      windowFromMs: verdict.window.fromMs, windowUntilMs: verdict.window.untilMs,
+    };
+  }
+
+  if (trigger.kind !== 'new_human_evidence' || !Array.isArray(trigger.evidence)) {
+    return fail('no_recent_human_trigger');
+  }
+  const evidence = trigger.evidence.filter(
+    (item): item is { messageId: string; quote: string } =>
+      typeof item?.messageId === 'string' && typeof item?.quote === 'string',
+  );
+  if (evidence.length === 0) return fail('no_recent_human_trigger');
+  // A recent message is a candidate, not proof of relevance: the trigger must
+  // be episode or follow-up material, never merely retrieved background.
+  for (const item of evidence) {
+    if (!input.episodeMessageIds.has(item.messageId) || !input.exposedMessageIds.has(item.messageId)) {
+      return fail('unrelated_trigger');
+    }
+  }
+  const validation = validateTriggerEvidence(ctx.db, {
+    guildId: ctx.config.discord.guildId,
+    cassandraId: ctx.config.discord.applicationId,
+    evidence,
+    now: input.now,
+    windowMs,
+  });
+  if (!validation.ok) return fail(validation.reason);
+
+  const messageIds = validation.records.map((record) => record.messageId);
+  const covered = findConsumedTriggerMessageIds(ctx.db, ctx.config.discord.guildId, messageIds);
+  const fresh = validation.records.filter((record) => !covered.has(record.messageId));
+  if (fresh.length === 0) return fail('revision_consumed');
+  const frontier = getSubjectConsumedFrontier(ctx.db, subjectId);
+  const newest = fresh.reduce((acc, record) => (record.createdAtMs > acc.createdAtMs ? record : acc));
+  if (!isNewerThanFrontier({ createdAtMs: newest.createdAtMs, messageId: newest.messageId }, frontier)) {
+    return fail('revision_consumed');
+  }
+
+  const { revisionId } = registerRevision(ctx.db, {
+    subjectId,
+    triggers: fresh,
+    now: input.now,
+  });
+  const revision = getRevision(ctx.db, revisionId)!;
+  if (!validateRevisionEvidence(ctx.db, revisionId, input.now)) return fail('trigger_changed');
+  const verdict = evaluateRevisionAdmission(
+    {
+      revisionId: revision.id, subjectId: revision.subjectId, state: revision.state,
+      humanEventAtMs: revision.humanEventAtMs, explicitDeadlineAtMs: revision.explicitDeadlineAtMs,
+    },
+    getClaim(ctx.db, revision.id),
+    input.now,
+    windowMs,
+  );
+  if (!verdict.eligible) return fail(verdict.reason);
+  return {
+    required: true, eligible: true, revisionId,
+    windowFromMs: verdict.window.fromMs, windowUntilMs: verdict.window.untilMs,
   };
 }
 
@@ -733,13 +915,22 @@ export async function routeEpisodeIntervention(
     evidenceStrength: intervention.dimensions.evidenceStrength, distinctRestrictedChannelCount: restrictedChannels.size,
     uncertain: provenanceGate.outcome === 'force_review' || outboundEvidence.outcome === 'force_review' });
   const rate = recentChecks(ctx, target.channelId, message, input.now, 'autonomous');
+  const attention = computeEpisodeAttentionAdmission(ctx, {
+    intervention,
+    memoryOutcome: input.memoryOutcome,
+    episodeMessageIds: input.episodeMessageIds,
+    exposedMessageIds,
+    exposedMemoryIds: new Set(input.result.provenance.memoryIds ?? []),
+    now: input.now,
+  });
   const routingInput = { mode: ctx.config.mode,
     thresholds: { score: ctx.config.intervention.threshold, confidence: ctx.config.intervention.minConfidence,
       evidenceStrength: ctx.config.intervention.minEvidenceStrength, maxContentLength: ctx.config.intervention.maxMessageCharacters },
     eligibility: { recommend: intervention.recommend === true, dimensions: intervention.dimensions,
       confidence: intervention.confidence ?? 0, evidenceStrength: intervention.dimensions.evidenceStrength,
       evidenceCount: evidenceIds.length, contentLength: message.length, hasDisallowedMention: sanitized.outcome === 'reject' },
-    provenanceGate, outboundEvidence, forcedReview, cooldown: rate.cooldown, duplicate: rate.duplicate };
+    provenanceGate, outboundEvidence, forcedReview, cooldown: rate.cooldown, duplicate: rate.duplicate,
+    attention };
   const routing = routeProposal(routingInput);
   const policyDecision = buildEpisodePolicyDecision(
     routingInput,
@@ -751,17 +942,59 @@ export async function routeEpisodeIntervention(
   const assembled = sanitized.outcome === 'allow'
     ? [sanitized.content, sanitized.sourceLinks.length ? sanitized.sourceLinks.map((l) => l.masked).join('\n') : ''].filter(Boolean).join('\n\n')
     : null;
-  const expiresAtMs = routing.state === 'pending_review' ? input.now + 72 * 60 * 60 * 1000 : null;
+  // The proposal deadline is the earlier of the ordinary 72-hour window and
+  // the immutable attention window end (Section 12.7).
+  const ordinaryExpiry = input.now + 72 * 60 * 60 * 1000;
+  const expiresAtMs = routing.state === 'pending_review'
+    ? (attention.windowUntilMs !== undefined ? Math.min(ordinaryExpiry, attention.windowUntilMs) : ordinaryExpiry)
+    : null;
   let proposalId = '';
+  let claimLost = false;
   if (routing.state === 'approved' && assembled) {
-    transaction(ctx.db, () => {
+    transactionImmediate(ctx.db, () => {
       proposalId = insertProposal(ctx.db, { runId: input.result.runId, episodeId: input.episode.id,
         targetChannelId: target.channelId, status: routing.state, computedScore: routing.score, reason: routing.reasons,
         policyDecision,
         message: assembled, evidenceMessageIds: evidenceIds, replyToMessageId: intervention.replyToMessageId,
         expiresAtMs, now: input.now });
+      // Claim the eligible revision atomically with the proposal it authorizes.
+      // A lost race downgrades this row to observed inside the same
+      // transaction: two attempts can never both own one revision.
+      if (attention.revisionId && !claimRevision(ctx.db, {
+        revisionId: attention.revisionId, proposalId, consumedAtMs: input.now,
+        eligibleFromMs: attention.windowFromMs ?? input.now,
+        eligibleUntilMs: attention.windowUntilMs ?? input.now,
+      })) {
+        claimLost = true;
+        ctx.db.prepare(
+          `UPDATE proposals SET status = 'observed', updated_at_ms = ?,
+             reason = 'attention gate (revision_consumed): the revision was claimed concurrently'
+           WHERE id = ?`,
+        ).run(input.now, proposalId);
+        return;
+      }
       enqueueOutbox(ctx.db, { proposalId, runId: input.result.runId, channelId: target.channelId,
         content: assembled, replyToMessageId: intervention.replyToMessageId, now: input.now });
+    });
+  } else if (routing.state === 'pending_review') {
+    transactionImmediate(ctx.db, () => {
+      proposalId = insertProposal(ctx.db, { runId: input.result.runId, episodeId: input.episode.id,
+        targetChannelId: target.channelId, status: routing.state, computedScore: routing.score, reason: routing.reasons,
+        policyDecision,
+        message: assembled, evidenceMessageIds: evidenceIds, replyToMessageId: intervention.replyToMessageId,
+        expiresAtMs, now: input.now });
+      if (attention.revisionId && !claimRevision(ctx.db, {
+        revisionId: attention.revisionId, proposalId, consumedAtMs: input.now,
+        eligibleFromMs: attention.windowFromMs ?? input.now,
+        eligibleUntilMs: attention.windowUntilMs ?? input.now,
+      })) {
+        claimLost = true;
+        ctx.db.prepare(
+          `UPDATE proposals SET status = 'observed', updated_at_ms = ?,
+             reason = 'attention gate (revision_consumed): the revision was claimed concurrently'
+           WHERE id = ?`,
+        ).run(input.now, proposalId);
+      }
     });
   } else {
     proposalId = insertProposal(ctx.db, { runId: input.result.runId, episodeId: input.episode.id,
@@ -772,7 +1005,7 @@ export async function routeEpisodeIntervention(
   }
   if (routing.state === 'approved' && assembled) {
     // The proposal and outbox are already durable in one transaction.
-  } else if (routing.state === 'pending_review' && assembled && ctx.config.reviewChannelId) {
+  } else if (routing.state === 'pending_review' && !claimLost && assembled && ctx.config.reviewChannelId) {
     try {
       await deliverProposalReview({ proposalId, targetLabel: targetRow?.name ? `#${targetRow.name}` : target.channelId,
         score: routing.score, reason: routing.reasons.join('; '), proposedMessage: sanitized.outcome === 'allow' ? sanitized.content : assembled,
@@ -820,6 +1053,20 @@ export async function createProductionJobRuntime(
     } : undefined,
   });
   ctx.logger.info({ event: 'jobs.startup_repair', ...repair }, 'durable work repaired before worker startup');
+
+  // Attention cutover runs before interactions and workers begin: pending
+  // legacy cards cannot be approved after the cutover, and crash recovery for
+  // uncertain sends runs later in this startup. No Discord or model I/O here.
+  const attentionCutover: AttentionCutoverReport = runAttentionCutover(ctx.db, {
+    now: ctx.now(),
+    guildId: ctx.config.discord.guildId,
+    actorUserId: ctx.config.discord.applicationId,
+    attentionWindowMs: ctx.config.intervention.attentionWindowDays * 86_400_000,
+  });
+  ctx.logger.info(
+    { event: 'attention.cutover', ...attentionCutover },
+    'proactive attention cutover completed',
+  );
 
   const models = builtinModels();
   const resolved = resolveAgentModels({
@@ -1174,6 +1421,8 @@ export async function createProductionJobRuntime(
     memoryMinimumImportance: ctx.config.memory.minimumImportance,
     memoryFollowupHorizonDays: ctx.config.memory.followupHorizonDays,
     memoryFollowupMaxMessages: ctx.config.memory.followupMaxMessages,
+    attentionWindowMs: ctx.config.intervention.attentionWindowDays * 86_400_000,
+    attentionTimezone: ctx.config.organization.timezone,
     routeIntervention: (input) => routeEpisodeIntervention(ctx, client, reviewSecret, input),
   });
   worker.register('review_episode', ctx.config.agentRuntime.maxConcurrency, async (payload, job) => {
@@ -1207,7 +1456,7 @@ export async function createProductionJobRuntime(
         ...routeOptions(),
         now: ctx.now,
         logger: ctx.logger,
-        stalenessHorizonMs: ctx.config.memory.stalenessHorizonDays * 86_400_000,
+        attentionWindowMs: ctx.config.intervention.attentionWindowDays * 86_400_000,
       }).dispatch();
     });
     const scheduledCohort = createReviewDueMemoryCohortHandler({
@@ -1228,6 +1477,9 @@ export async function createProductionJobRuntime(
         memoryMinimumConfidence: ctx.config.memory.minimumConfidence,
         memoryMinimumImportance: ctx.config.memory.minimumImportance,
         scheduledReminderIntervalMs: ctx.config.memory.scheduledReviewReminderDays * 86_400_000,
+        attentionWindowMs: ctx.config.intervention.attentionWindowDays * 86_400_000,
+        attentionTimezone: ctx.config.organization.timezone,
+        cassandraId: ctx.config.discord.applicationId,
       },
       resolveWorkingScope: (targetChannelId) => resolveScheduledWorkingScope(
         ctx.db,
@@ -1371,11 +1623,11 @@ export async function createProductionJobRuntime(
   worker.register('maintenance', 1, async () => {
     await runPeriodicMaintenanceCycle({
       expireProposals: () => expiry.runExpiry(),
-      expireStaleMemories: () => expireStaleMemories(ctx.db, {
-        horizonMs: ctx.config.memory.stalenessHorizonDays * 86_400_000,
+      expireAttention: () => expireClosedAttentionRevisions(ctx.db, {
+        now: ctx.now(),
+        windowMs: ctx.config.intervention.attentionWindowDays * 86_400_000,
         actorUserId: ctx.config.discord.applicationId,
         guildId: ctx.config.discord.guildId,
-        now: ctx.now(),
       }),
       maintainDatabase: () => maintenance.runDatabaseMaintenance(),
       repairDeepRecaps: () => repairDeepRecapOwnership(ctx.db, { now: ctx.now() }),
