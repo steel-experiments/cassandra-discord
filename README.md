@@ -41,12 +41,7 @@ answers with links to permitted source messages. When it spots a contradiction
 or a forgotten decision, it can stay silent, propose an intervention for human
 review, or post within limits you control.
 
-> **@Cassandra** what did we decide about the API rate limit?
->
-> On 2026-08-14 the team decided to keep the limit at 100 requests per minute
-> for partners and 10 for everyone else (two linked messages from
-> `#api-design`). A lower limit was proposed later, but I found no newer
-> decision.
+![Cassandra recalls a migration risk with source links, then declines a question without permitted evidence.](assets/cassandra-example.png)
 
 It runs as one Node.js process with one SQLite database and one persistent data
 directory. There is no PostgreSQL, Redis, vector database, or message broker.
