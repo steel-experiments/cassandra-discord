@@ -240,3 +240,13 @@ Stop and report back without improvising if:
 - The compatibility fallback is intentional for older/model-degraded output. Do not remove it until durable proposals and all supported model versions are guaranteed to emit markers.
 - A future cleanup may extract the duplicated channel/date label resolver and cited-message assembly shared by episode, scheduled, and direct-answer paths. That refactor is deferred because this plan fixes one visible defect without changing working consumers.
 
+## Adversarial review round (2026-09-17)
+
+Six findings were confirmed against the finished implementation. Dispositions:
+
+- The card-preview proof was tautological (an identity helper tested against its own input). Fixed: the pending-review test now seeds a stub Discord client and a review channel, captures the real embed, and asserts the exact assembled text is quoted with no separate per-link block.
+- The `hasDisallowedMention` eligibility flag made the stored routing reason misreport marker and overflow failures as a mention. Fixed: the specific outbound-safety reasons are appended to the stored reason list; the policy-decision audit keeps them as before.
+- The one-to-three marker prompt contract was not host-enforced, so repeated markers could multiply rendered links. Fixed: `assembleEpisodeIntervention` rejects more than three markers, with a regression test.
+- Spec and operator docs said links are "never" listed per line; a proposal assembled before this format and still pending delivers its stored per-line layout until it resolves. The wording now states that bounded transition.
+- Left as-is (cosmetic, parity with the scheduled-delivery exemplar): the 64-character label cap can truncate a citation label built from a very long channel name, and a `review-message.ts` comment still cites a 1,800-character maximum premise. The embed-description invariant was verified to still hold at the new 2,000-character assembly cap.
+
