@@ -321,6 +321,7 @@ export interface AppConfig {
   mode: AutonomyMode;
   reviewChannelId: string | undefined;
   adminRoleIds: string[];
+  deletionApproverUserIds: string[];
   httpAdminToken: string | undefined;
   ingestion: IngestionConfig;
   episodes: EpisodeConfig;
@@ -816,6 +817,7 @@ export function loadConfig(options: LoadConfigOptions = {}): AppConfig {
       'CASSANDRA_ADMIN_ROLE_IDS is empty; admin operations stay denied',
     );
   }
+  const deletionApproverUserIds = parseSnowflakeList(env(e, 'CASSANDRA_DELETION_APPROVER_USER_IDS'), 'CASSANDRA_DELETION_APPROVER_USER_IDS');
   const httpAdminToken = env(e, 'HTTP_ADMIN_TOKEN');
 
   // ---- Intervention (env overrides YAML overrides defaults) ----
@@ -1109,6 +1111,7 @@ export function loadConfig(options: LoadConfigOptions = {}): AppConfig {
     mode,
     reviewChannelId,
     adminRoleIds,
+    deletionApproverUserIds,
     httpAdminToken,
     ingestion,
     episodes,

@@ -110,13 +110,13 @@ export const CASSANDRA_SUBCOMMANDS: readonly SubcommandSpec[] = [
   },
   {
     name: 'forget-message',
-    description: 'Remove normalized content and derived evidence as policy allows.',
+    description: 'Request message deletion; independent approval and a 24-hour cancellation window are required.',
     options: [idOption('Message id to forget.')],
   },
   {
     name: 'forget-user',
-    description: "Queue removal of a user's content and evidence links to secure review.",
-    options: [idOption('User id whose content to forget.')],
+    description: 'Request user-history deletion; independent approval and a 24-hour cancellation window are required.',
+    options: [{ name: 'user', description: 'Discord user whose stored messages to delete.', required: true, kind: 'user' }],
   },
   { name: 'reload-policy', description: 'Validate and reload YAML/templates.', options: [] },
   { name: 'backup', description: 'Create an online SQLite backup.', options: [] },
@@ -127,6 +127,21 @@ export const CASSANDRA_SUBCOMMANDS: readonly SubcommandSpec[] = [
  * The Section 27 `mcp-token` subcommand group: create / list / revoke (Section 32.5.2).
  */
 export const CASSANDRA_SUBCOMMAND_GROUPS: readonly SubcommandGroupSpec[] = [
+  {
+    name: 'deletion',
+    description: 'Review, approve, or cancel deletion requests in the secure review channel.',
+    subcommands: [
+      { name: 'status', description: 'Show deletion requests and purge progress.',
+        options: [{ ...idOption('Full request ID; omit for the latest requests.'), required: false }] },
+      { name: 'approve', description: 'Approve another admin’s request; starts a 24-hour cancellation window.',
+        options: [idOption('Full deletion request ID.'),
+          { name: 'confirmation', description: 'Enter DELETE after reviewing the target and message count.', required: false, kind: 'string' }] },
+      { name: 'cancel', description: 'Cancel your request or, as a deletion approver, any request before purge starts.',
+        options: [idOption('Full deletion request ID.')] },
+      { name: 'retry', description: 'Original approver: retry a failed purge of the remaining approved messages.',
+        options: [idOption('Full deletion request ID.')] },
+    ],
+  },
   {
     name: 'recap',
     description: 'Run, inspect, retry, or cancel a durable budgeted deep recap.',

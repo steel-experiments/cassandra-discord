@@ -60,8 +60,10 @@ changes.
 > ## Correction and deletion
 >
 > Ask [operator contact] to correct or remove stored data. Cassandra admins can
-> remove one message with `/cassandra forget-message` or queue removal of one
-> user's message content with `/cassandra forget-user`.
+> request removal with `/cassandra forget-message` or `/cassandra forget-user`.
+> A different authorized deletion approver must approve the request. A 24-hour
+> cancellation window follows approval; content remains available until the purge
+> starts. The final purge cannot be undone, and does not delete Discord originals.
 >
 > ## Logs
 >

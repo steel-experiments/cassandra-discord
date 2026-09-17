@@ -143,13 +143,14 @@ Use this sequence on every install kind:
 2. Stop Cassandra and confirm no process holds the database open.
 3. Preserve the entire damaged data directory. Do not overwrite your only copy.
 4. Copy the chosen standalone backup to the configured `DATABASE_PATH`.
-5. Make sure stale `-wal` and `-shm` files from the damaged database are not
+5. Reconcile completed deletions and cancelled requests against the preserved ledger
+   as described below, before starting Cassandra. Make sure stale `-wal` and `-shm` files from the damaged database are not
    placed beside the restored file.
 6. Verify the digest before the first start (see below).
 7. Start Cassandra. Startup applies any migrations newer than the backup.
 8. Wait for reconciliation and durable jobs to settle.
 9. Compare `/cassandra channels` with the current policy.
-10. Recheck deletion requests made after the backup timestamp.
+10. Verify completed deletions and pending requests against the preserved audit ledger.
 11. Move to review or autonomous mode only after the restored state is
     checked.
 
@@ -225,12 +226,21 @@ A backup contains the deletion state that existed when it was created. It
 cannot contain a request made later. Restoring an older backup can therefore
 bring back content that was deleted after that backup.
 
-Keep a deletion-request ledger outside the Cassandra database if your
-retention or legal requirements demand reliable replay. After a restore,
-reissue every `forget-message` and `forget-user` request newer than the
-backup timestamp. If the preserved damaged database is readable, its admin
-audit records can help reconstruct those requests, but it should not be your
-only deletion ledger.
+Keep a deletion ledger outside the Cassandra database if reliable replay is required.
+Before starting Cassandra on a restored database, reconcile the preserved audit
+ledger and tombstones for **completed** purges, including committed batches of
+partially executed requests. Do this offline so restored forgotten content is never
+available to retrieval or model processing. This is an operator recovery procedure,
+not an undo feature. Do not blindly reissue every historical request: pending or
+cancelled requests do not authorize deletion, and the new commands require separate
+approval plus a 24-hour grace period.
+
+Reconcile cancellations too: an older backup may contain a scheduled request that
+was subsequently cancelled. Cancel that restored request before starting workers.
+A restored approved request whose deadline has passed can otherwise run immediately.
+The readable preserved database and content-free admin events help reconstruct
+these states; they should not be the only copy of the ledger. The normal new-request
+flow is documented in [Discord commands](../reference/discord-commands.md#memory-and-deletion).
 
 Older backups may retain content until both local and off-host retention
 remove them. State that delay plainly in the privacy notice.

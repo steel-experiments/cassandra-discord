@@ -3,7 +3,7 @@ title: Cassandra for Discord — Final Implementation Specification
 status: Final v1 specification
 version: 1.4
 date: 2026-08-21
-last_amended: 2026-09-16
+last_amended: 2026-09-17
 target_runtime: Node.js container
 target_platforms:
   - Coolify on a single VM
@@ -493,7 +493,8 @@ remediation, but evidence retrieval still omits every inaccessible, deleted, tes
 or missing source message and never returns its content.
 
 This read-time quarantine is not the explicit deletion workflow. `/cassandra
-forget-message` tombstones and, by default, purges the normalized source content, removes
+forget-message` requests the independently approved, delayed purge in Section 27.1.
+At execution it tombstones and purges the normalized source content, removes
 the source's evidence links, and then invalidates or fail-closed re-scopes the affected
 memories according to the remaining evidence.
 
@@ -3508,8 +3509,12 @@ Recommended guild-scoped commands:
 | `/cassandra dismiss <id>` | Admin | Dismiss a proposal. |
 | `/cassandra memory-search <query>` | Admin | Search organizational memory. |
 | `/cassandra memory-get <id>` | Admin | Read one complete memory and permitted source-message links. |
-| `/cassandra forget-message <id>` | Admin | Remove normalized content and derived evidence as policy allows. |
-| `/cassandra forget-user <id>` | Admin | Queue removal of a user's message content and evidence links; memories that depended on that evidence go to secure review. |
+| `/cassandra forget-message <id>` | Admin request | Request deletion of one stored message; no immediate purge. |
+| `/cassandra forget-user <user>` | Admin request | Select a Discord user and request deletion of their currently stored messages; no immediate purge. |
+| `/cassandra deletion status [id]` | Admin | Show latest four requests or one exact request, including identities, counts, deadline, progress, and worker failure. |
+| `/cassandra deletion approve <id> [confirmation]` | Deletion approver + Admin | Preview, then confirm another admin's request with `DELETE`; schedule no earlier than 24 hours later. |
+| `/cassandra deletion cancel <id>` | Requester or deletion approver + Admin | Cancel a pending or scheduled request before purge begins. |
+| `/cassandra deletion retry <id>` | Original deletion approver + Admin | Retry a failed purge job with its original approved manifest and deadline. |
 | `/cassandra reload-policy` | Admin | Validate and reload YAML/templates. File mode only; basic mode reports that a restart is required. |
 | `/cassandra backup` | Admin | Queue an online SQLite backup, return a short job ID, and privately notify the requester after verified completion. |
 | `/cassandra integrity-check` | Admin | Run database integrity checks. |
@@ -3541,6 +3546,66 @@ and environment identify the same secure review channel. A transition to
 `observe` immediately holds queued proposal sends while leaving ingestion,
 memory review, and explicit direct answers active; a send already in flight is
 allowed to finish. Every attempted mode change is recorded in `admin_events`.
+
+### 27.1 Safe administrative deletion
+
+`forget-user` and `forget-message` create requests, never immediate deletion.
+The user target is a Discord user-picker option; message IDs must be numeric Discord
+snowflakes. Unknown, already-deleted, and zero-match targets do not queue work.
+All deletion commands require a currently resolved Cassandra admin role and invocation
+in the configured secure review channel, whose live policy must accept `org`,
+`restricted`, and `review_only` scopes. Replies are ephemeral, with allowed mentions
+disabled, and contain identity and count metadata rather than source text.
+
+`CASSANDRA_DELETION_APPROVER_USER_IDS` is a separate explicit user-ID allowlist. Empty
+means new requests and approvals are disabled. An approver also requires an admin
+role and must be different from the requester, including for self-targeted requests.
+With one configured owner, another administrator must initiate requests for that
+owner to approve. The host never infers deletion authority from the ordinary admin
+role. Request, denial, approval, cancellation, retry, revoked authority, and completion
+are recorded without source content. The owner discovers requests with `deletion
+status`; automatic cards and DMs are not part of this workflow.
+
+Migration 040 creates `deletion_requests` with guild, target kind/ID, requester,
+approver, state, original message count, processed count, creation/approval/deadline/
+completion timestamps, and exact job ownership. `deletion_request_messages` holds
+only the fixed message IDs captured transactionally at request creation. No content
+is duplicated. One active request per guild/kind/target is allowed. New messages and
+late backfill never expand that manifest; they require a new request.
+
+The states are `pending` → `scheduled` → `executing` → `completed`. `pending` and
+`scheduled` can become `cancelled`. Approval requires an exact request ID and explicit
+`DELETE` confirmation after preview; repeated approval cannot move the deadline.
+The deadline is approval time plus 24 hours. Content stays stored and usable until
+the purge starts. The requester or a deletion approver can cancel until the first
+batch starts, even if the worker is late. Once execution starts there is no normal
+cancel or undo. Observe mode and `/cassandra pause` do not hold these jobs.
+
+An `execute_deletion` job carries only a request ID. Before each bounded batch the
+host verifies the configured guild, exact persisted job ownership and active lease,
+request state, independent approver identity, current approver allowlist, and elapsed
+grace period. The purge and manifest progress commit together in an immediate
+transaction; continuation requeues the same job in that transaction. Crashes cannot
+lose the remaining manifest or authorize an earlier purge. Failed jobs are visible
+in status and only the original still-authorized approver can retry them. Job retention
+preserves jobs owned by scheduled or executing deletion requests until that request
+is terminal or a replacement retry owns it.
+
+Removing an approver from configuration revokes remaining execution on the next
+batch after restart. That request becomes cancelled with an honest processed count;
+already purged content is never restored. Restoring the allowlist does not revive it.
+Each processed message uses the existing deterministic deletion workflow: purge
+normalized content, retain the tombstone, remove evidence and proactive-attention
+support, and invalidate or narrow dependent memories. Archived file removal remains
+durable asynchronous cleanup. `completed` describes completion of the message
+batches, not guaranteed completion of the attachment cleanup jobs. Discord originals
+are untouched and no hidden undo archive is created.
+
+Migration 040 cancels queued/running legacy `forget_user` jobs, recording their job
+IDs in the audit log. The legacy handler refuses all later invocations; old payloads
+never confer approval. Already completed deletions are not restored. This is a
+forward-only schema boundary: use a forward corrective image or a verified pre-040
+restore, never run an image lacking the applied migration against this database.
 
 ---
 
@@ -4509,7 +4574,8 @@ CREATE TABLE IF NOT EXISTS admin_events (
   `032_proposal_review_message_index`, `033_inspector_run_observability`, and
   `034_agent_run_usage_breakdown`, `035_episode_reasoning_shadow`, and
   `036_agent_run_execution_start`, `037_ingestion_recovery`,
-  `038_proactive_attention`, and `039_deadline_decisions` are explicit
+  `038_proactive_attention`, `039_deadline_decisions`, and
+  `040_deletion_requests` are explicit
   forward-only boundaries. Migration 028
   is the indexed cursor boundary for the thread-aware channel inspector. Migration 029 adds deterministic keyset indexes
   for the remaining inspector archives: memories, memory evidence, proposals, outbox
@@ -5254,6 +5320,7 @@ CHANNEL_POLICY_PATH=/app/config/channel-policy.yml
 CASSANDRA_MODE=observe
 CASSANDRA_REVIEW_CHANNEL_ID=
 CASSANDRA_ADMIN_ROLE_IDS=
+CASSANDRA_DELETION_APPROVER_USER_IDS=
 HTTP_ADMIN_TOKEN=
 
 # Optional artifact identity when the platform does not supply trusted metadata.
@@ -6098,7 +6165,8 @@ Organizations with stronger requirements can shorten backup intervals.
 2. Preserve the damaged data directory.
 3. Place the chosen backup as `/app/data/cassandra.sqlite`.
 4. Remove stale `-wal` and `-shm` files only after confirming the application is stopped and the selected backup is a completed standalone backup.
-5. Run integrity check.
+5. Reconcile completed deletion tombstones (including committed partial batches) and
+   subsequent request cancellations from the preserved ledger offline; then run integrity check.
 6. Start Cassandra.
 7. Confirm schema version.
 8. Let startup reconciliation catch newer Discord messages.
@@ -6106,7 +6174,13 @@ Organizations with stronger requirements can shorten backup intervals.
 
 ### 42.4 Deletion and backups
 
-A deletion request cannot immediately erase content from historical backup files. Document backup retention and expiration. Restoring an older backup must be followed by re-applying recorded deletion tombstones where required.
+A deletion request cannot immediately erase content from historical backup files.
+Document backup retention and expiration. Before exposing a restored database,
+reapply recorded tombstones for completed purges and committed partial batches,
+and reconcile requests cancelled after the backup. Pending/cancelled requests do
+not authorize deletion; blindly reissuing every historical request is incorrect.
+A restored scheduled request whose deadline has passed may otherwise execute as
+soon as workers start. This offline recovery procedure is not a post-purge undo.
 
 ---
 
@@ -6660,6 +6734,10 @@ The v1 implementation is complete when all are true:
 - Mention parsing is disabled.
 - Logs contain no message text by default.
 - Admin actions are audited.
+- Administrative forgetting requires an independent allowlisted approver, a fixed
+  message manifest, and a 24-hour cancellable grace period. No source is purged
+  before the deadline, cancellation survives restart, and legacy jobs cannot bypass
+  approval. Completed purges have no undo.
 - Missing, stale, forged, unauthorized, or concurrently resolved channel review state
   cannot broaden visibility, and org promotion does not widen existing memories.
 - Inspector exposure drilldowns revalidate current message/memory visibility, cap output,

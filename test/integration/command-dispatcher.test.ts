@@ -37,6 +37,7 @@ interface FakeOptions {
   strings?: Readonly<Record<string, string | null>>;
   integers?: Readonly<Record<string, number | null>>;
   channels?: Readonly<Record<string, string | null>>;
+  users?: Readonly<Record<string, string | null>>;
 }
 
 function fakeInteraction(opts: FakeOptions): Record<string, unknown> {
@@ -67,6 +68,7 @@ function fakeInteraction(opts: FakeOptions): Record<string, unknown> {
         if (required && value === null) throw new Error(`required integer option ${name} is missing`);
         return value;
       },
+      getUser: (name: string) => ({ id: opts.users?.[name] ?? '' }),
       getChannel: (name: string, required = false) => {
         const id = opts.channels?.[name] ?? null;
         if (required && id === null) throw new Error(`required channel option ${name} is missing`);
@@ -89,6 +91,7 @@ function makeDeps(db: DatabaseSync, ctxOverrides: Record<string, unknown> = {}):
     config: {
       discord: { guildId: GUILD },
       adminRoleIds: ADMIN_ROLES,
+      deletionApproverUserIds: [ADMIN],
       mcp: { enabled: false },
       inspector: { enabled: false },
       historicalMemory: { campaignId: undefined },
@@ -137,6 +140,24 @@ describe('command dispatcher routing', () => {
 
   afterEach(() => {
     env.cleanup();
+  });
+
+  it('routes the user picker to a request and grouped approval to the dedicated approver gate', async () => {
+    const { deps, handler } = makeDeps(db);
+    deps.ctx.config.reviewChannelId = CHANNEL;
+    deps.ctx.snapshot!.channelPolicy.review_channel = { id: CHANNEL, secure: true, accepts_scopes: ['org', 'restricted', 'review_only'] };
+    const userId = '100000000000000003';
+    db.prepare(`INSERT INTO messages (id,guild_id,channel_id,author_id,author_display_name,content,created_at_ms,ingested_at_ms,updated_at_ms)
+      VALUES ('800000000000000001',?,?,?,'Alice','keep me',?,?,?)`).run(GUILD, CHANNEL, userId, NOW, NOW, NOW);
+    const interaction = fakeInteraction({ subcommand: 'forget-user', group: null, users: { user: userId } });
+    await handler(interaction);
+    const row = db.prepare('SELECT id,target_id,status FROM deletion_requests').get()!;
+    expect(row).toMatchObject({ target_id: userId, status: 'pending' });
+    expect(db.prepare('SELECT content FROM messages').get()?.content).toBe('keep me');
+    const approval = fakeInteraction({ subcommand: 'approve', group: 'deletion', strings: { id: String(row.id), confirmation: 'DELETE' } });
+    await handler(approval);
+    expect(JSON.stringify(approval.__replies)).toContain('cannot approve your own');
+    expect(deps.ctx.db.prepare('SELECT status FROM deletion_requests').get()?.status).toBe('pending');
   });
 
   it('covers every declarative command and group route', () => {

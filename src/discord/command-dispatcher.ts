@@ -1,4 +1,4 @@
-import { statSync, unlinkSync } from 'node:fs';
+import { statSync } from 'node:fs';
 import { orgDayStartMs } from '../agent/cooldowns.js';
 import { Events, type ChatInputCommandInteraction, type Client } from 'discord.js';
 import type { BootstrapContext, DiscordWiring } from '../bootstrap.js';
@@ -12,8 +12,9 @@ import { handleProposalsCommand, formatProposalsReply, handleApproveCommand, han
   formatApproveReply, formatDismissReply } from './commands/proposals.js';
 import { handleMemorySearchCommand, formatMemorySearchReply,
   handleMemoryGetCommand, formatMemoryGetReply } from './commands/memory-search.js';
-import { handleForgetMessageCommand, formatForgetMessageReply } from './commands/forget-message.js';
-import { handleForgetUserCommand, formatForgetUserReply } from './commands/forget-user.js';
+import { handleForgetMessageCommand } from './commands/forget-message.js';
+import { handleForgetUserCommand } from './commands/forget-user.js';
+import { handleDeletionCommand, type DeletionSubcommand } from './commands/deletion.js';
 import { handleReloadPolicyCommand, formatReloadPolicyReply } from './commands/reload-policy.js';
 import { handleIntegrityCheckCommand, formatIntegrityCheckReply } from './commands/integrity.js';
 import { handleMcpTokenCommand, formatMcpTokenReply, type McpTokenSubcommand } from './commands/mcp-token.js';
@@ -289,7 +290,19 @@ function routeBackup({ deps, base, common }: RouteArgs): string {
     : 'A backup is already queued or running. Check `/cassandra status` for its state.';
 }
 
+function deletionDeps({ deps, common }: RouteArgs) {
+  const { ctx } = deps;
+  const review = (ctx.configStore?.get() ?? ctx.snapshot)?.channelPolicy.review_channel;
+  const safeReview = review?.secure && review.id === ctx.config.reviewChannelId
+    && ['org', 'restricted', 'review_only'].every((scope) => review.accepts_scopes.some((accepted) => accepted === scope));
+  return { ...common, deletionApproverUserIds: ctx.config.deletionApproverUserIds,
+    reviewChannelId: safeReview ? ctx.config.reviewChannelId : undefined };
+}
+
 const groupRoutes = completeRouteMap(CASSANDRA_SUBCOMMAND_GROUPS.map((group) => group.name), [
+  ['deletion', (args) => handleDeletionCommand({ ...args.base, invocationChannelId: args.i.channelId,
+    subcommand: args.i.options.getSubcommand() as DeletionSubcommand, requestId: args.i.options.getString('id'),
+    confirmation: args.i.options.getString('confirmation') }, deletionDeps(args))],
   ['recap', routeDeepRecap],
   ['historical', routeHistorical],
   ['mcp-token', routeMcpToken],
@@ -310,14 +323,10 @@ const commandRoutes = completeRouteMap(CASSANDRA_SUBCOMMANDS.map((command) => co
     query: i.options.getString('query', true), invocationChannelId: i.channelId }, { ...common, reviewChannelId: deps.ctx.config.reviewChannelId }))],
   ['memory-get', ({ i, deps, base, common }) => formatMemoryGetReply(handleMemoryGetCommand({ ...base,
     memoryId: i.options.getString('id', true), invocationChannelId: i.channelId }, { ...common, reviewChannelId: deps.ctx.config.reviewChannelId }))],
-  ['forget-message', ({ i, base, common }) => {
-    const id = i.options.getString('id', true);
-    return formatForgetMessageReply(id, handleForgetMessageCommand({ ...base, messageId: id }, { ...common, unlinkAttachment: unlinkSync }));
-  }],
-  ['forget-user', ({ i, deps, base, common }) => {
-    const id = i.options.getString('id', true);
-    return formatForgetUserReply(id, handleForgetUserCommand({ ...base, userId: id }, { ...common, enqueue: (input) => enqueue(deps.ctx.db, input) }));
-  }],
+  ['forget-message', (args) => handleForgetMessageCommand({ ...args.base,
+    invocationChannelId: args.i.channelId, messageId: args.i.options.getString('id', true) }, deletionDeps(args))],
+  ['forget-user', (args) => handleForgetUserCommand({ ...args.base,
+    invocationChannelId: args.i.channelId, userId: args.i.options.getUser('user', true).id }, deletionDeps(args))],
   ['reload-policy', routeReloadPolicy],
   ['backup', routeBackup],
   ['integrity-check', ({ base, common }) => formatIntegrityCheckReply(handleIntegrityCheckCommand(base, common))],

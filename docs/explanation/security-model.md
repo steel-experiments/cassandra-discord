@@ -76,9 +76,11 @@ its result, so a rename skips queued work or discards an in-flight result before
 create memory or an intervention.
 
 That quarantine preserves the record for safe remediation; it is distinct from
-`/cassandra forget-message`. The explicit forget workflow tombstones and normally
-purges the source content, removes its evidence links, then invalidates or fail-closed
-re-scopes dependent memories from what remains.
+`/cassandra forget-message`. Both forget commands first create an auditable request
+for a fixed set of messages. A different admin explicitly allowlisted as a deletion
+approver must confirm it; a 24-hour cancellation window follows. Only then does the
+worker tombstone and purge source content, remove its evidence links, and invalidate
+or narrow dependent memories from what remains. There is no post-purge undo.
 
 ## Outbound controls
 

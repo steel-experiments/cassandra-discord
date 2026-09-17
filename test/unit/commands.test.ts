@@ -49,7 +49,7 @@ describe('command surface matches Section 27', () => {
   });
 
   it('declares the mcp-token and inspector-token groups with create / list / revoke', () => {
-    expect(CASSANDRA_SUBCOMMAND_GROUPS).toHaveLength(4);
+    expect(CASSANDRA_SUBCOMMAND_GROUPS).toHaveLength(5);
     const group = CASSANDRA_SUBCOMMAND_GROUPS.find((g) => g.name === 'mcp-token')!;
     expect(group.name).toBe('mcp-token');
     expect(group.subcommands.map((s) => s.name).sort()).toEqual(['create', 'list', 'revoke']);
@@ -58,8 +58,8 @@ describe('command surface matches Section 27', () => {
     expect(inspector.subcommands.map((s) => s.name).sort()).toEqual(['create', 'list', 'revoke']);
   });
 
-  it('flattens to the full twenty-nine Section 27 endpoints', () => {
-    expect(listCommandEndpoints()).toHaveLength(29);
+  it('flattens to the full thirty-three Section 27 endpoints', () => {
+    expect(listCommandEndpoints()).toHaveLength(33);
     expect(listCommandEndpoints()).toContain('mcp-token create');
     expect(listCommandEndpoints()).toContain('mcp-token revoke');
     expect(listCommandEndpoints()).toContain('inspector-token create');
@@ -95,11 +95,9 @@ describe('subcommand options', () => {
     expect(q?.required).toBe(true);
   });
 
-  it('forget-message and forget-user require an id', () => {
-    for (const name of ['forget-message', 'forget-user']) {
-      const id = flat.get(name)!.options.find((o) => o.name === 'id');
-      expect(id?.required).toBe(true);
-    }
+  it('forget-message requires a message ID and forget-user uses a Discord user picker', () => {
+    expect(flat.get('forget-message')!.options[0]).toMatchObject({ name: 'id', kind: 'string', required: true });
+    expect(flat.get('forget-user')!.options[0]).toMatchObject({ name: 'user', kind: 'user', required: true });
   });
 
   it('sync exposes an optional channel filter', () => {
@@ -175,8 +173,8 @@ describe('compiled REST payload', () => {
   it('emits every flat subcommand and the mcp-token group with the right option types', () => {
     const opts = payload.options ?? [];
     const subTypes = new Map(opts.map((o) => [o.name, o.type]));
-    // 16 subcommands + 4 groups.
-    expect(opts).toHaveLength(20);
+    // 16 subcommands + 5 groups.
+    expect(opts).toHaveLength(21);
     for (const name of CASSANDRA_SUBCOMMANDS.map((s) => s.name)) {
       expect(subTypes.get(name)).toBe(ApplicationCommandOptionType.Subcommand);
     }

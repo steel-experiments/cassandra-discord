@@ -2,10 +2,6 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { type DatabaseSync } from '../../src/db/database.js';
 import { createTestDb, seedIdentity } from '../helpers/db.js';
 import { forgetMessage } from '../../src/memory/deletion.js';
-import {
-  handleForgetMessageCommand,
-  formatForgetMessageReply,
-} from '../../src/discord/commands/forget-message.js';
 import { getAdminEvent } from '../../src/db/repositories/admin-events.js';
 import { getMemoryDetails } from '../../src/memory/search.js';
 import { rescopeMemories } from '../../src/memory/maintenance.js';
@@ -275,82 +271,5 @@ describe('forgetMessage — derived memory handling', () => {
     const res = forgetMessage(d, { messageId: 'm1', guildId, actorUserId: userId, nowMs: FORGET_NOW });
     expect(res.memories[0]?.action).toBe('evidence_removed');
     expect(memoryState(d, 'mem1').status).toBe('resolved');
-  });
-});
-
-describe('handleForgetMessageCommand — authorization and reply', () => {
-  const ADMIN_ROLE = '900000000000000001';
-
-  it('denies and audits when the caller lacks an admin role, without deleting', () => {
-    const d = db();
-    const { guildId, userId } = seedIdentity(d);
-    seedChannel(d, ORG, 'org', guildId);
-    seedMessage(d, 'm1', ORG, guildId, userId, 'keep-me');
-
-    const out = handleForgetMessageCommand(
-      { messageId: 'm1', actorUserId: userId, guildId, memberRoleIds: ['000000000000000009'] },
-      { db: d, adminRoleIds: [ADMIN_ROLE], nowMs: FORGET_NOW },
-    );
-    expect(out.kind).toBe('not_authorized');
-    // Nothing was deleted.
-    const msg = d.prepare('SELECT deleted_at_ms FROM messages WHERE id = ?').get('m1') as {
-      deleted_at_ms: number | null;
-    };
-    expect(msg.deleted_at_ms).toBeNull();
-  });
-
-  it('denies fail-closed when no admin roles are configured', () => {
-    const d = db();
-    const { guildId, userId } = seedIdentity(d);
-    const out = handleForgetMessageCommand(
-      { messageId: 'm1', actorUserId: userId, guildId, memberRoleIds: [ADMIN_ROLE] },
-      { db: d, adminRoleIds: [], nowMs: FORGET_NOW },
-    );
-    expect(out).toMatchObject({ kind: 'not_authorized', reason: 'no_admin_roles_configured' });
-  });
-
-  it('runs the deletion when authorized', () => {
-    const d = db();
-    const { guildId, userId } = seedIdentity(d);
-    seedChannel(d, ORG, 'org', guildId);
-    seedMessage(d, 'm1', ORG, guildId, userId, 'gone');
-    const out = handleForgetMessageCommand(
-      { messageId: 'm1', actorUserId: userId, guildId, memberRoleIds: [ADMIN_ROLE] },
-      { db: d, adminRoleIds: [ADMIN_ROLE], nowMs: FORGET_NOW },
-    );
-    expect(out.kind).toBe('ok');
-    if (out.kind !== 'ok') return;
-    expect(out.result.tombstoned).toBe(true);
-  });
-
-  it('reply never echoes content and summarizes counts', () => {
-    const d = db();
-    const { guildId, userId } = seedIdentity(d);
-    seedChannel(d, ORG, 'org', guildId);
-    seedMessage(d, 'm1', ORG, guildId, userId, 'SECRETVALUE');
-    const out = handleForgetMessageCommand(
-      { messageId: 'm1', actorUserId: userId, guildId, memberRoleIds: [ADMIN_ROLE] },
-      { db: d, adminRoleIds: [ADMIN_ROLE], nowMs: FORGET_NOW },
-    );
-    const reply = formatForgetMessageReply('m1', out);
-    expect(reply).not.toContain('SECRETVALUE');
-    expect(reply).toContain('Forgot message');
-    expect(reply).toContain('Memories reviewed');
-  });
-
-  it('reply for an unknown id is clean', () => {
-    const reply = formatForgetMessageReply('ghost', {
-      kind: 'ok',
-      result: {
-        found: false,
-        messageId: 'ghost',
-        tombstoned: false,
-        attachmentsMarkedDeleted: 0,
-        attachmentLocalPaths: [],
-        memories: [],
-        adminEventId: 'ev',
-      },
-    });
-    expect(reply).toContain('No message found');
   });
 });

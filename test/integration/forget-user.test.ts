@@ -1,339 +1,232 @@
-import { describe, it, expect, afterEach } from 'vitest';
-import { type DatabaseSync } from '../../src/db/database.js';
-import { createTestDb, seedIdentity } from '../helpers/db.js';
-import {
-  forgetUserBatch,
-  createForgetUserHandler,
-} from '../../src/jobs/handlers/forget-user.js';
-import {
-  handleForgetUserCommand,
-  formatForgetUserReply,
-  forgetUserJobKey,
-} from '../../src/discord/commands/forget-user.js';
-import { enqueue } from '../../src/jobs/queue.js';
-
-/**
- * forget-user deletion workflow (Sections 27, 42.4, 43).
- *
- * Acceptance: the workflow resumes after interruption and leaves no retrievable
- * target-user content or orphaned evidence links.
- */
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { createTestDb, seedIdentity, type TestDb } from '../helpers/db.js';
+import { pruneTerminalJobs } from '../../src/db/maintenance.js';
+import { openDatabase } from '../../src/db/database.js';
+import { handleForgetUserCommand } from '../../src/discord/commands/forget-user.js';
+import { handleForgetMessageCommand } from '../../src/discord/commands/forget-message.js';
+import { handleDeletionCommand, type DeletionCommandDeps, type DeletionCommandInput } from '../../src/discord/commands/deletion.js';
+import { DELETION_GRACE_MS, getDeletionRequest, type DeletionRequest } from '../../src/memory/deletion-requests.js';
+import { createExecuteDeletionHandler } from '../../src/jobs/handlers/execute-deletion.js';
+import { createForgetUserHandler } from '../../src/jobs/handlers/forget-user.js';
+import { claimNextJob, completeJob, enqueue, failJob, getJob, reclaimExpiredLeases } from '../../src/jobs/queue.js';
 
 const NOW = 1_700_000_000_000;
-const RUN_NOW = NOW + 1000;
-const ORG = '300000000000000001';
-const RESTRICTED_A = '300000000000000010';
-const ADMIN_ROLE = '900000000000000001';
-
-let setup: ReturnType<typeof createTestDb> | null = null;
-function freshDb(): DatabaseSync {
-  setup = createTestDb();
-  return setup.db;
-}
-afterEach(() => {
-  setup?.cleanup();
-  setup = null;
+const ROLE = '900000000000000001';
+const OWNER = '900000000000000002';
+const MSG = '800000000000000001';
+let t: TestDb;
+let identity: ReturnType<typeof seedIdentity>;
+let base: DeletionCommandInput;
+let deps: DeletionCommandDeps;
+beforeEach(() => {
+  t = createTestDb();
+  identity = seedIdentity(t.db);
+  base = { actorUserId: identity.userId, guildId: identity.guildId, memberRoleIds: [ROLE], invocationChannelId: identity.channelId };
+  deps = { db: t.db, nowMs: NOW, adminRoleIds: [ROLE], deletionApproverUserIds: [OWNER], reviewChannelId: identity.channelId };
+  message(MSG);
 });
-
-function seedChannel(d: DatabaseSync, id: string, visibility: string, guildId: string): void {
-  d.prepare(
-    `INSERT INTO channels (id, guild_id, parent_id, type, name, is_thread, is_archived, is_locked,
-       ingest_enabled, visibility_class, allow_interventions, discovered_at_ms, updated_at_ms)
-     VALUES (?, ?, NULL, 0, ?, 0, 0, 0, 1, ?, 1, ?, ?)`,
-  ).run(id, guildId, id, visibility, NOW, NOW);
+afterEach(() => t.cleanup());
+function message(id: string, time = NOW): void {
+  t.db.prepare(`INSERT INTO messages (id,guild_id,channel_id,author_id,author_display_name,content,created_at_ms,ingested_at_ms,updated_at_ms)
+    VALUES (?,?,?,?,?,'uniquesecret',?,?,?)`).run(id, identity.guildId, identity.channelId, identity.userId, 'Niko', time, time, time);
 }
-function seedUser(d: DatabaseSync, id: string): void {
-  d.prepare(
-    `INSERT INTO users (id, username, global_name, is_bot, first_seen_at_ms, last_seen_at_ms)
-     VALUES (?, ?, ?, 0, ?, ?)`,
-  ).run(id, id, id, NOW, NOW);
+function request(): DeletionRequest {
+  handleForgetUserCommand({ ...base, userId: identity.userId }, deps);
+  return t.db.prepare('SELECT * FROM deletion_requests ORDER BY created_at_ms DESC LIMIT 1').get() as unknown as DeletionRequest;
 }
-function seedMessage(
-  d: DatabaseSync,
-  id: string,
-  channelId: string,
-  guildId: string,
-  authorId: string,
-  content: string,
-): void {
-  d.prepare(
-    `INSERT INTO messages (id, guild_id, channel_id, author_id, author_display_name, content,
-       created_at_ms, ingested_at_ms, updated_at_ms)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(id, guildId, channelId, authorId, authorId, content, NOW, NOW, NOW);
+function approve(row: DeletionRequest): string {
+  return handleDeletionCommand({ ...base, actorUserId: OWNER, subcommand: 'approve', requestId: row.id, confirmation: 'DELETE' }, deps);
 }
-function seedMemory(d: DatabaseSync, id: string, guildId: string, scopeType: string, scopeKey: string | null): void {
-  d.prepare(
-    `INSERT INTO memories (id, guild_id, scope_type, scope_key, type, statement, status,
-       confidence, importance, first_seen_at_ms, last_confirmed_at_ms, created_at_ms, updated_at_ms)
-     VALUES (?, ?, ?, ?, 'decision', ?, 'active', 0.8, 0.7, ?, ?, ?, ?)`,
-  ).run(id, guildId, scopeType, scopeKey, `memory ${id}`, NOW, NOW, NOW, NOW);
-}
-function seedEvidence(d: DatabaseSync, memoryId: string, messageId: string, stance = 'origin'): void {
-  d.prepare(
-    `INSERT INTO memory_evidence (memory_id, message_id, stance, weight, created_at_ms)
-     VALUES (?, ?, ?, 1, ?)`,
-  ).run(memoryId, messageId, stance, NOW);
-}
-function undeletedCountByUser(d: DatabaseSync, userId: string): number {
-  return Number(
-    d.prepare('SELECT count(*) AS n FROM messages WHERE author_id = ? AND deleted_at_ms IS NULL').get(userId)?.n ?? 0,
-  );
-}
-function orphanedEvidenceCount(d: DatabaseSync, userId: string): number {
-  // Evidence links that still reference a deleted message by the target user.
-  return Number(
-    d
-      .prepare(
-        `SELECT count(*) AS n FROM memory_evidence me
-         JOIN messages m ON m.id = me.message_id
-         WHERE m.author_id = ? AND m.deleted_at_ms IS NOT NULL`,
-      )
-      .get(userId)?.n ?? 0,
-  );
+function read(row: DeletionRequest): DeletionRequest { return getDeletionRequest(t.db, row.id, identity.guildId)!; }
+function content(): unknown { return t.db.prepare('SELECT content FROM messages WHERE id = ?').get(MSG)?.content; }
+async function batch(now = NOW + DELETION_GRACE_MS, batchSize = 100): Promise<void> {
+  const job = claimNextJob(t.db, { type: 'execute_deletion', now, owner: 'worker', leaseMs: 60_000 });
+  expect(job).toBeDefined();
+  await createExecuteDeletionHandler({ db: t.db, guildId: identity.guildId, deletionApproverUserIds: deps.deletionApproverUserIds, now: () => now, batchSize })
+    (JSON.parse(job!.payload_json) as { requestId: string }, job!);
+  completeJob(t.db, job!.id, now);
 }
 
-function seedWorld(d: DatabaseSync) {
-  const { guildId, userId: adminId } = seedIdentity(d);
-  seedChannel(d, ORG, 'org', guildId);
-  seedChannel(d, RESTRICTED_A, 'restricted', guildId);
-  const target = '400000000000000020';
-  const other = '400000000000000021';
-  seedUser(d, target);
-  seedUser(d, other);
-  return { guildId, adminId, target, other };
-}
-
-describe('forgetUserBatch — restart-safe batched removal', () => {
-  it('resumes across batches until no target-user content remains', () => {
-    const d = freshDb();
-    const { guildId, adminId, target } = seedWorld(d);
-    for (let i = 0; i < 5; i++) seedMessage(d, `tm${i}`, ORG, guildId, target, `content-${i}`);
-
-    const b1 = forgetUserBatch(d, { userId: target, guildId, actorUserId: adminId, nowMs: RUN_NOW, batchSize: 2 });
-    expect(b1.processed).toBe(2);
-    expect(b1.remaining).toBe(3);
-    expect(b1.complete).toBe(false);
-
-    const b2 = forgetUserBatch(d, { userId: target, guildId, actorUserId: adminId, nowMs: RUN_NOW, batchSize: 2 });
-    expect(b2.processed).toBe(2);
-    expect(b2.remaining).toBe(1);
-
-    const b3 = forgetUserBatch(d, { userId: target, guildId, actorUserId: adminId, nowMs: RUN_NOW, batchSize: 2 });
-    expect(b3.processed).toBe(1);
-    expect(b3.remaining).toBe(0);
-    expect(b3.complete).toBe(true);
-
-    expect(undeletedCountByUser(d, target)).toBe(0);
-    // Tombstones retained for integrity (rows still present, just deleted).
-    const tombstoned = d.prepare('SELECT count(*) AS n FROM messages WHERE author_id = ? AND deleted_at_ms IS NOT NULL').get(target)?.n;
-    expect(tombstoned).toBe(5);
+describe('safe deletion requests', () => {
+  it('rejects literal names and unknown IDs instead of reporting a queued purge', () => {
+    expect(handleForgetUserCommand({ ...base, userId: 'niko' }, deps)).toContain('Invalid target');
+    expect(handleForgetUserCommand({ ...base, userId: '700000000000000001' }, deps)).toContain('No stored');
+    expect(t.db.prepare('SELECT count(*) n FROM deletion_requests').get()?.n).toBe(0);
+    expect(t.db.prepare('SELECT count(*) n FROM jobs').get()?.n).toBe(0);
+    expect(content()).toBe('uniquesecret');
   });
-
-  it('is idempotent: a batch on a fully-forgotten user is a no-op', () => {
-    const d = freshDb();
-    const { guildId, adminId, target } = seedWorld(d);
-    seedMessage(d, 'tm0', ORG, guildId, target, 'only');
-    forgetUserBatch(d, { userId: target, guildId, actorUserId: adminId, nowMs: RUN_NOW });
-    const again = forgetUserBatch(d, { userId: target, guildId, actorUserId: adminId, nowMs: RUN_NOW });
-    expect(again.processed).toBe(0);
-    expect(again.complete).toBe(true);
+  it('requires admin access and the secure review channel before revealing any count', () => {
+    expect(handleForgetUserCommand({ ...base, userId: identity.userId, memberRoleIds: [] }, deps)).toContain('not authorized');
+    expect(handleForgetUserCommand({ ...base, userId: identity.userId, invocationChannelId: 'elsewhere' }, deps)).toContain('secure review');
+    expect(handleForgetUserCommand({ ...base, userId: identity.userId }, { ...deps, reviewChannelId: undefined })).toContain('secure review');
+    expect(t.db.prepare('SELECT count(*) n FROM deletion_requests').get()?.n).toBe(0);
   });
-
-  it('leaves other users content untouched', () => {
-    const d = freshDb();
-    const { guildId, adminId, target, other } = seedWorld(d);
-    seedMessage(d, 'tm0', ORG, guildId, target, 'target content');
-    seedMessage(d, 'om0', ORG, guildId, other, 'other content');
-    forgetUserBatch(d, { userId: target, guildId, actorUserId: adminId, nowMs: RUN_NOW });
-    expect(undeletedCountByUser(d, target)).toBe(0);
-    expect(undeletedCountByUser(d, other)).toBe(1);
+  it('defaults to disabled when no deletion approver is configured', () => {
+    expect(handleForgetUserCommand({ ...base, userId: identity.userId }, { ...deps, deletionApproverUserIds: [] })).toContain('disabled');
   });
-
-  it('leaves no retrievable content (FTS) and no orphaned evidence links', () => {
-    const d = freshDb();
-    const { guildId, adminId, target } = seedWorld(d);
-    const UNIQUE = 'uniqftstoken';
-    seedMessage(d, 'tm0', ORG, guildId, target, UNIQUE);
-    seedMemory(d, 'mem1', guildId, 'org', null);
-    seedEvidence(d, 'mem1', 'tm0');
-
-    expect(undeletedCountByUser(d, target)).toBe(1);
-    expect(orphanedEvidenceCount(d, target)).toBe(0); // link exists, message not yet deleted
-
-    forgetUserBatch(d, { userId: target, guildId, actorUserId: adminId, nowMs: RUN_NOW });
-
-    expect(undeletedCountByUser(d, target)).toBe(0);
-    const fts = d.prepare('SELECT count(*) AS n FROM messages_fts WHERE messages_fts MATCH ?').get(UNIQUE)?.n;
-    expect(fts).toBe(0); // content absent from retrieval
-    expect(orphanedEvidenceCount(d, target)).toBe(0); // no orphaned links
+  it('freezes a preview without deleting, retains content for cancellation, and deduplicates requests', () => {
+    const row = request();
+    expect(row).toMatchObject({ status: 'pending', message_count: 1, job_id: null });
+    expect(content()).toBe('uniquesecret');
+    const reply = handleForgetUserCommand({ ...base, userId: identity.userId }, deps);
+    expect(reply).toContain(row.id);
+    expect(reply).not.toContain('uniquesecret');
+    expect(t.db.prepare('SELECT count(*) n FROM deletion_requests').get()?.n).toBe(1);
   });
-
-  it('routes dependent memories to secure review and aggregates dispositions', () => {
-    const d = freshDb();
-    const { guildId, adminId, target, other } = seedWorld(d);
-    // org evidence by ANOTHER user survives the forget; restricted evidence by
-    // the target is removed, which would broaden the memory's scope to org.
-    seedMessage(d, 'orgOther', ORG, guildId, other, 'org evidence');
-    seedMessage(d, 'rest1', RESTRICTED_A, guildId, target, 'restricted evidence');
-    seedMemory(d, 'mem1', guildId, 'channel', RESTRICTED_A);
-    seedEvidence(d, 'mem1', 'orgOther');
-    seedEvidence(d, 'mem1', 'rest1');
-
-    const res = forgetUserBatch(d, { userId: target, guildId, actorUserId: adminId, nowMs: RUN_NOW });
-    // Forgetting rest1 (restricted) leaves only org evidence -> would broaden to org -> routed to review.
-    expect(res.memoryDispositions.some((m) => m.action === 'routed_to_review')).toBe(true);
+  it('gives forget-message the same request-only semantics', () => {
+    expect(handleForgetMessageCommand({ ...base, messageId: MSG }, deps)).toContain('Nothing has been deleted');
+    expect(content()).toBe('uniquesecret');
+    expect(t.db.prepare('SELECT target_kind,message_count FROM deletion_requests').get()).toEqual({ target_kind: 'message', message_count: 1 });
   });
-});
-
-describe('createForgetUserHandler — continuation and completion', () => {
-  it('enqueues a unique-less continuation when a batch leaves work remaining', async () => {
-    const d = freshDb();
-    const { guildId, adminId, target } = seedWorld(d);
-    for (let i = 0; i < 3; i++) seedMessage(d, `tm${i}`, ORG, guildId, target, `c-${i}`);
-    const enqueued: unknown[] = [];
-    const handler = createForgetUserHandler({
-      db: d,
-      guildId,
-      actorUserId: adminId,
-      batchSize: 2,
-      now: () => RUN_NOW,
-      enqueue: (input) => {
-        enqueued.push(input);
-        return { id: 'cont-1', enqueued: true };
-      },
-    });
-    const out = await handler.runForgetUser(target);
-    expect(out.result.complete).toBe(false);
-    expect(out.continuation).toEqual({ id: 'cont-1', enqueued: true });
-    expect(enqueued).toHaveLength(1);
-    const call = enqueued[0] as { type: string; payload: { userId: string }; uniqueKey?: string | null };
-    expect(call.type).toBe('forget_user');
-    expect(call.payload.userId).toBe(target);
-    expect(call.uniqueKey).toBeUndefined(); // continuation must not carry a unique key
+  it('requires a separate allowlisted admin and explicit confirmation', () => {
+    const row = request();
+    expect(handleDeletionCommand({ ...base, actorUserId: '900000000000000003', subcommand: 'approve', requestId: row.id, confirmation: 'DELETE' }, deps)).toContain('admin role alone');
+    expect(handleDeletionCommand({ ...base, subcommand: 'approve', requestId: row.id, confirmation: 'DELETE' }, { ...deps, deletionApproverUserIds: [base.actorUserId] })).toContain('cannot approve your own');
+    expect(handleDeletionCommand({ ...base, actorUserId: OWNER, memberRoleIds: null, subcommand: 'approve', requestId: row.id, confirmation: 'DELETE' }, deps)).toContain('not authorized');
+    expect(handleDeletionCommand({ ...base, actorUserId: OWNER, subcommand: 'approve', requestId: row.id }, deps)).toContain('confirmation:DELETE');
+    expect(read(row).status).toBe('pending');
+    expect(approve(row)).toContain('Scheduled for deletion');
+    expect(read(row)).toMatchObject({ status: 'scheduled', execute_after_ms: NOW + DELETION_GRACE_MS });
+    expect(approve(row)).toContain('already scheduled');
+    expect(t.db.prepare("SELECT count(*) n FROM jobs WHERE type='execute_deletion'").get()?.n).toBe(1);
   });
-
-  it('records a completion admin event and enqueues no continuation when done', async () => {
-    const d = freshDb();
-    const { guildId, adminId, target } = seedWorld(d);
-    seedMessage(d, 'tm0', ORG, guildId, target, 'one');
-    let enqueueCalls = 0;
-    const handler = createForgetUserHandler({
-      db: d,
-      guildId,
-      actorUserId: adminId,
-      now: () => RUN_NOW,
-      enqueue: () => {
-        enqueueCalls += 1;
-        return { id: 'x', enqueued: true };
-      },
-    });
-    const out = await handler.runForgetUser(target);
-    expect(out.result.complete).toBe(true);
-    expect(out.continuation).toBeUndefined();
-    expect(enqueueCalls).toBe(0);
-    // Completion event recorded.
-    const ev = d
-      .prepare("SELECT action, target FROM admin_events WHERE action = 'forget_user_complete'")
-      .get() as { action: string; target: string };
-    expect(ev.target).toBe(target);
+  it('never deletes before the deadline even if the job is made runnable early', async () => {
+    const row = request(); approve(row);
+    expect(claimNextJob(t.db, { type: 'execute_deletion', now: NOW, owner: 'worker', leaseMs: 60_000 })).toBeUndefined();
+    t.db.prepare("UPDATE jobs SET run_after_ms = ? WHERE type='execute_deletion'").run(NOW);
+    await batch(NOW);
+    expect(content()).toBe('uniquesecret');
+    expect(getJob(t.db, read(row).job_id!)?.run_after_ms).toBe(NOW + DELETION_GRACE_MS);
+    expect(read(row).status).toBe('scheduled');
   });
-
-  it('the registered handler shape runs without throwing', async () => {
-    const d = freshDb();
-    const { guildId, adminId, target } = seedWorld(d);
-    seedMessage(d, 'tm0', ORG, guildId, target, 'one');
-    const handler = createForgetUserHandler({ db: d, guildId, actorUserId: adminId, now: () => RUN_NOW });
-    const job = { id: 'j1', type: 'forget_user' as const, unique_key: null, payload_json: JSON.stringify({ userId: target }), status: 'running' as const, priority: 100, run_after_ms: RUN_NOW, lease_owner: null, lease_until_ms: null, attempts: 0, max_attempts: 10, last_error: null, created_at_ms: NOW, updated_at_ms: NOW, completed_at_ms: null };
-    await expect(handler({ userId: target }, job)).resolves.toBeUndefined();
+  it.each(['pending', 'scheduled'] as const)('requester can cancel %s without losing any data', async (state) => {
+    const row = request(); if (state === 'scheduled') approve(row);
+    const jobId = read(row).job_id;
+    expect(handleDeletionCommand({ ...base, subcommand: 'cancel', requestId: row.id }, deps)).toContain('No messages were deleted');
+    expect(read(row).status).toBe('cancelled');
+    if (jobId) expect(getJob(t.db, jobId)?.status).toBe('cancelled');
+    expect(t.db.prepare('SELECT count(*) n FROM deletion_request_messages').get()?.n).toBe(0);
+    expect(content()).toBe('uniquesecret');
+    expect(approve(row)).toContain('already cancelled');
   });
-});
-
-describe('handleForgetUserCommand — authorization and enqueue', () => {
-  it('authorizes and enqueues a per-user unique job', () => {
-    const d = freshDb();
-    const { guildId, adminId, target } = seedWorld(d);
-    let enqueuedInput: unknown = null;
-    const out = handleForgetUserCommand(
-      { userId: target, actorUserId: adminId, guildId, memberRoleIds: [ADMIN_ROLE] },
-      {
-        db: d,
-        adminRoleIds: [ADMIN_ROLE],
-        nowMs: RUN_NOW,
-        enqueue: (input) => {
-          enqueuedInput = input;
-          return { id: 'job-1', enqueued: true };
-        },
-      },
-    );
-    expect(out.kind).toBe('queued');
-    if (out.kind !== 'queued') return;
-    expect(out.jobId).toBe('job-1');
-    expect((enqueuedInput as { uniqueKey: string }).uniqueKey).toBe(forgetUserJobKey(target));
+  it('allows owner cancellation but not an unrelated administrator', () => {
+    const row = request(); approve(row);
+    expect(handleDeletionCommand({ ...base, actorUserId: '700000000000000002', subcommand: 'cancel', requestId: row.id }, deps)).toContain('Only the requester');
+    expect(handleDeletionCommand({ ...base, actorUserId: OWNER, subcommand: 'cancel', requestId: row.id }, deps)).toContain('cancelled');
   });
-
-  it('reports already_running when the unique enqueue collapses', () => {
-    const d = freshDb();
-    const { guildId, adminId, target } = seedWorld(d);
-    const out = handleForgetUserCommand(
-      { userId: target, actorUserId: adminId, guildId, memberRoleIds: [ADMIN_ROLE] },
-      {
-        db: d,
-        adminRoleIds: [ADMIN_ROLE],
-        nowMs: RUN_NOW,
-        enqueue: () => ({ id: 'existing', enqueued: false }),
-      },
-    );
-    expect(out.kind).toBe('already_running');
+  it('cancellation wins even after a job is leased but before purge starts', async () => {
+    const row = request(); approve(row);
+    const now = NOW + DELETION_GRACE_MS;
+    const job = claimNextJob(t.db, { type: 'execute_deletion', now, owner: 'worker', leaseMs: 60_000 })!;
+    handleDeletionCommand({ ...base, subcommand: 'cancel', requestId: row.id }, { ...deps, nowMs: now });
+    await createExecuteDeletionHandler({ db: t.db, guildId: identity.guildId, deletionApproverUserIds: [OWNER], now: () => now })({ requestId: row.id }, job);
+    expect(content()).toBe('uniquesecret');
+    expect(read(row).status).toBe('cancelled');
   });
-
-  it('denies fail-closed and audits when unauthorized', () => {
-    const d = freshDb();
-    const { guildId, adminId, target } = seedWorld(d);
-    let enqueueCalls = 0;
-    const out = handleForgetUserCommand(
-      { userId: target, actorUserId: adminId, guildId, memberRoleIds: ['000000000000000009'] },
-      {
-        db: d,
-        adminRoleIds: [ADMIN_ROLE],
-        nowMs: RUN_NOW,
-        enqueue: () => {
-          enqueueCalls += 1;
-          return { id: 'x', enqueued: true };
-        },
-      },
-    );
-    expect(out.kind).toBe('not_authorized');
-    expect(enqueueCalls).toBe(0);
-    const ev = d
-      .prepare("SELECT details_json FROM admin_events WHERE action = 'forget_user'")
-      .get() as { details_json: string };
-    expect(JSON.parse(ev.details_json)).toMatchObject({ authorized: false });
+  it('purges content, FTS, evidence, memory support, and durably queues attachment removal', async () => {
+    t.db.prepare(`INSERT INTO memories (id,guild_id,scope_type,type,statement,status,confidence,importance,
+      first_seen_at_ms,last_confirmed_at_ms,created_at_ms,updated_at_ms)
+      VALUES ('memory',?,'org','decision','derived statement','active',0.8,0.7,?,?,?,?)`).run(identity.guildId, NOW, NOW, NOW, NOW);
+    t.db.prepare("INSERT INTO memory_evidence (memory_id,message_id,stance,weight,created_at_ms) VALUES ('memory',?,'origin',1,?)").run(MSG, NOW);
+    t.db.prepare(`INSERT INTO attachments (id,message_id,filename,size_bytes,source_url,archive_status,local_path,created_at_ms,updated_at_ms)
+      VALUES ('att',?,'file',1,'https://example.com','stored','/archive/file',?,?)`).run(MSG, NOW, NOW);
+    const row = request(); approve(row); await batch();
+    expect(content()).toBe('');
+    expect(t.db.prepare('SELECT count(*) n FROM messages_fts WHERE messages_fts MATCH ?').get('uniquesecret')?.n).toBe(0);
+    expect(t.db.prepare('SELECT count(*) n FROM memory_evidence').get()?.n).toBe(0);
+    expect(t.db.prepare("SELECT status FROM memories WHERE id='memory'").get()?.status).toBe('invalidated');
+    expect(t.db.prepare("SELECT count(*) n FROM jobs WHERE type='purge_attachment_file'").get()?.n).toBe(1);
+    expect(read(row)).toMatchObject({ status: 'completed', processed_count: 1 });
+    expect(t.db.prepare('SELECT message_id FROM message_tombstones').get()?.message_id).toBe(MSG);
+    expect(JSON.stringify(t.db.prepare('SELECT details_json FROM admin_events').all())).not.toContain('uniquesecret');
   });
-
-  it('enqueue collapse is idempotent end-to-end against the real queue', () => {
-    const d = freshDb();
-    const { guildId, adminId, target } = seedWorld(d);
-    const first = handleForgetUserCommand(
-      { userId: target, actorUserId: adminId, guildId, memberRoleIds: [ADMIN_ROLE] },
-      { db: d, adminRoleIds: [ADMIN_ROLE], nowMs: RUN_NOW, enqueue: (i) => enqueue(d, i) },
-    );
-    const second = handleForgetUserCommand(
-      { userId: target, actorUserId: adminId, guildId, memberRoleIds: [ADMIN_ROLE] },
-      { db: d, adminRoleIds: [ADMIN_ROLE], nowMs: RUN_NOW, enqueue: (i) => enqueue(d, i) },
-    );
-    expect(first.kind).toBe('queued');
-    expect(second.kind).toBe('already_running');
+  it('never adds new messages or late backfilled history to the approved manifest', async () => {
+    const row = request();
+    message('800000000000000002', NOW + 1);
+    message('800000000000000003', NOW - 100_000);
+    approve(row); await batch();
+    expect(t.db.prepare('SELECT count(*) n FROM messages WHERE deleted_at_ms IS NULL').get()?.n).toBe(2);
+    expect(content()).toBe('');
   });
-
-  it('reply never echoes message content', () => {
-    const secret = 'SUPERSECRET-TOKEN';
-    const r1 = formatForgetUserReply('u1', { kind: 'queued', jobId: 'j1' });
-    expect(r1).toContain('u1');
-    expect(r1).not.toContain(secret);
-    expect(formatForgetUserReply('u1', { kind: 'already_running' })).toContain('in progress');
-    expect(formatForgetUserReply('u1', { kind: 'not_authorized', reason: 'not_authorized' })).toContain(
-      'not authorized',
-    );
+  it('continues bounded batches after reopen and denies undo once any purge has started', async () => {
+    message('800000000000000002');
+    const row = request(); approve(row); await batch(NOW + DELETION_GRACE_MS, 1);
+    expect(read(row)).toMatchObject({ status: 'executing', processed_count: 1 });
+    expect(handleDeletionCommand({ ...base, subcommand: 'cancel', requestId: row.id }, deps)).toContain('before the purge starts');
+    t.db.close(); t.db = openDatabase(t.path); deps.db = t.db;
+    await batch(NOW + DELETION_GRACE_MS + 1, 1);
+    expect(read(row)).toMatchObject({ status: 'completed', processed_count: 2 });
+    expect(handleDeletionCommand({ ...base, subcommand: 'cancel', requestId: row.id }, deps)).toContain('cannot be undone');
+  });
+  it('does not delete after the approver allowlist is revoked', async () => {
+    const row = request(); approve(row); deps.deletionApproverUserIds = [];
+    await batch();
+    expect(content()).toBe('uniquesecret');
+    expect(read(row).status).toBe('cancelled');
+    expect(t.db.prepare("SELECT action FROM admin_events WHERE action='deletion_authority_revoked'").get()).toBeDefined();
+  });
+  it('reclaims crashed leases and only lets the original approver retry terminal job failures', async () => {
+    const row = request(); approve(row);
+    const now = NOW + DELETION_GRACE_MS;
+    const oldJob = claimNextJob(t.db, { type: 'execute_deletion', now, owner: 'crashed', leaseMs: 1 })!;
+    expect(reclaimExpiredLeases(t.db, now + 2)).toBe(1);
+    const job = claimNextJob(t.db, { type: 'execute_deletion', now: now + 2, owner: 'worker', leaseMs: 60_000 })!;
+    expect(job.id).toBe(oldJob.id);
+    t.db.prepare('UPDATE jobs SET max_attempts = 1 WHERE id = ?').run(job.id);
+    failJob(t.db, { id: job.id, error: new Error('failure'), now: now + 2 });
+    expect(handleDeletionCommand({ ...base, subcommand: 'status', requestId: row.id }, deps)).toContain('Worker failed');
+    expect(handleDeletionCommand({ ...base, subcommand: 'retry', requestId: row.id }, deps)).toContain('Only a configured');
+    expect(handleDeletionCommand({ ...base, actorUserId: OWNER, subcommand: 'retry', requestId: row.id }, { ...deps, nowMs: now + 2 })).toContain('retry queued');
+    await batch(now + 3);
+    expect(read(row).status).toBe('completed');
+  });
+  it('ignores stale or forged job ownership and isolates request lookups by guild', async () => {
+    const row = request(); approve(row);
+    const now = NOW + DELETION_GRACE_MS;
+    const job = claimNextJob(t.db, { type: 'execute_deletion', now, owner: 'worker', leaseMs: 60_000 })!;
+    const handler = createExecuteDeletionHandler({ db: t.db, guildId: identity.guildId, deletionApproverUserIds: [OWNER], now: () => now });
+    await handler({ requestId: row.id }, { ...job, id: 'different' });
+    await handler({ requestId: row.id }, { ...job, lease_owner: 'stale' });
+    expect(content()).toBe('uniquesecret');
+    expect(getDeletionRequest(t.db, row.id, 'different-guild')).toBeUndefined();
+  });
+  it('rolls back a partially attempted batch and its evidence/tombstone changes on failure', async () => {
+    message('800000000000000002');
+    const row = request(); approve(row);
+    t.db.exec(`CREATE TRIGGER fail_second BEFORE UPDATE ON messages WHEN NEW.id = '800000000000000002'
+      BEGIN SELECT RAISE(ABORT, 'injected failure'); END;`);
+    await expect(batch()).rejects.toThrow('injected failure');
+    expect(content()).toBe('uniquesecret');
+    expect(read(row)).toMatchObject({ status: 'scheduled', processed_count: 0 });
+    expect(t.db.prepare('SELECT count(*) n FROM message_tombstones').get()?.n).toBe(0);
+  });
+  it('requeues an expired lease instead of stranding a scheduled request as succeeded', async () => {
+    const row = request(); approve(row);
+    const now = NOW + DELETION_GRACE_MS;
+    const job = claimNextJob(t.db, { type: 'execute_deletion', now, owner: 'worker', leaseMs: 1 })!;
+    await createExecuteDeletionHandler({ db: t.db, guildId: identity.guildId, deletionApproverUserIds: [OWNER], now: () => now + 2 })({ requestId: row.id }, job);
+    completeJob(t.db, job.id, now + 2);
+    expect(getJob(t.db, job.id)?.status).toBe('queued');
+    expect(content()).toBe('uniquesecret');
+    await batch(now + 3);
+    expect(read(row).status).toBe('completed');
+  });
+  it('retains a failed job while its request needs recovery, then prunes it after cancellation', () => {
+    const row = request(); approve(row);
+    const now = NOW + DELETION_GRACE_MS;
+    const job = claimNextJob(t.db, { type: 'execute_deletion', now, owner: 'worker', leaseMs: 60_000 })!;
+    t.db.prepare('UPDATE jobs SET max_attempts = 1 WHERE id = ?').run(job.id);
+    failJob(t.db, { id: job.id, error: new Error('failure'), now });
+    const later = now + 40 * DELETION_GRACE_MS;
+    expect(pruneTerminalJobs(t.db, { nowMs: later, retentionDays: 30 }).deleted).toBe(0);
+    expect(handleDeletionCommand({ ...base, subcommand: 'status', requestId: row.id }, deps)).toContain('Worker failed');
+    handleDeletionCommand({ ...base, subcommand: 'cancel', requestId: row.id }, deps);
+    expect(pruneTerminalJobs(t.db, { nowMs: later, retentionDays: 30 }).deleted).toBe(1);
+  });
+  it('legacy forget-user jobs can never bypass approval', async () => {
+    enqueue(t.db, { type: 'forget_user', payload: { userId: identity.userId }, now: NOW });
+    const job = claimNextJob(t.db, { type: 'forget_user', owner: 'worker', now: NOW, leaseMs: 60_000 })!;
+    await expect(createForgetUserHandler()({ userId: identity.userId }, job)).rejects.toThrow('Legacy deletion disabled');
+    expect(content()).toBe('uniquesecret');
   });
 });

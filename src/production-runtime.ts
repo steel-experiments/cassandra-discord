@@ -68,6 +68,7 @@ import { createRescopeMemoriesHandler } from './jobs/handlers/rescope-memories.j
 import { expireClosedAttentionRevisions, type ExpireAttentionResult } from './memory/attention-repository.js';
 import { runAttentionCutover, type AttentionCutoverReport } from './memory/attention-cutover.js';
 import { createForgetUserHandler } from './jobs/handlers/forget-user.js';
+import { createExecuteDeletionHandler } from './jobs/handlers/execute-deletion.js';
 import { createArchiveAttachmentHandler } from './jobs/handlers/archive-attachment.js';
 import { createPurgeAttachmentFileHandler } from './jobs/handlers/purge-attachment-file.js';
 import { createDiscordSender } from './discord/sender.js';
@@ -1706,8 +1707,9 @@ export async function createProductionJobRuntime(
   });
   worker.register('rescope_memories', 1, createRescopeMemoriesHandler({ db: ctx.db, guildId: ctx.config.discord.guildId,
     actorUserId: ctx.config.discord.applicationId, now: ctx.now }));
-  worker.register('forget_user', 1, createForgetUserHandler({ db: ctx.db, guildId: ctx.config.discord.guildId,
-    actorUserId: ctx.config.discord.applicationId, now: ctx.now, enqueue: (input) => enqueue(ctx.db, input) }));
+  worker.register('forget_user', 1, createForgetUserHandler());
+  worker.register('execute_deletion', 1, createExecuteDeletionHandler({ db: ctx.db, guildId: ctx.config.discord.guildId,
+    deletionApproverUserIds: ctx.config.deletionApproverUserIds, now: ctx.now }));
   worker.register('discover_threads', ctx.config.ingestion.backfillConcurrency, async () => {
     const descriptors = await fetchDiscoveryDescriptors(client, ctx.config.discord.guildId);
     await runStartupSync({ db: ctx.db, guildId: ctx.config.discord.guildId, policy: snapshot().channelPolicy, now: ctx.now(),

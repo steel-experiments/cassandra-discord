@@ -154,140 +154,144 @@ function invalidateMemoryRow(db: DatabaseSync, memoryId: string, nowMs: number):
  * and does no destructive work.
  */
 export function forgetMessage(db: DatabaseSync, input: ForgetMessageInput): ForgetMessageResult {
-  return transaction(db, () => {
-    const retainDeletedContent = input.retainDeletedContent ?? false;
+  return transaction(db, () => forgetMessageInTransaction(db, input));
+}
 
-    const existing = prepareCached(
+/** Internal purge primitive: caller must hold the write transaction. */
+export function forgetMessageInTransaction(db: DatabaseSync, input: ForgetMessageInput): ForgetMessageResult {
+  if (!db.isTransaction) throw new Error('Message purge requires a transaction');
+  const retainDeletedContent = input.retainDeletedContent ?? false;
+
+  const existing = prepareCached(
+    db,
+    'forget.read_message',
+    'SELECT id FROM messages WHERE id = ?',
+  ).get(input.messageId) as { id: string } | undefined;
+
+  const dispositions: ForgetMemoryDisposition[] = [];
+  let tombstoned = false;
+  let attachmentsMarkedDeleted = 0;
+  const attachmentLocalPaths: string[] = [];
+
+  recordMessageTombstone(db, {
+    messageId: input.messageId,
+    guildId: input.guildId,
+    deletedAtMs: input.nowMs,
+  });
+
+  if (existing) {
+    // Capture local paths before the DB rows clear them, so the caller can unlink.
+    attachmentLocalPaths.push(...listAttachmentLocalPaths(db, input.messageId));
+
+    tombstoned = deleteMessage(db, input.messageId, {
+      retainDeletedContent,
+      nowMs: input.nowMs,
+    }) > 0;
+    attachmentsMarkedDeleted = markAttachmentsDeleted(db, input.messageId, input.nowMs);
+
+    const lookup = channelLookup(db);
+    const memoryIds = prepareCached(
       db,
-      'forget.read_message',
-      'SELECT id FROM messages WHERE id = ?',
-    ).get(input.messageId) as { id: string } | undefined;
+      'forget.dependent_memories',
+      'SELECT DISTINCT memory_id FROM memory_evidence WHERE message_id = ?',
+    ).all(input.messageId) as Array<{ memory_id: string }>;
 
-    const dispositions: ForgetMemoryDisposition[] = [];
-    let tombstoned = false;
-    let attachmentsMarkedDeleted = 0;
-    const attachmentLocalPaths: string[] = [];
+    // Purge source-linked proactive-attention evidence for the forgotten
+    // message. Revisions left without trigger evidence are invalidated and
+    // their claims stand, so the evidence cannot return as fresh.
+    purgeAttentionForMessage(db, input.messageId, input.nowMs);
 
-    recordMessageTombstone(db, {
-      messageId: input.messageId,
-      guildId: input.guildId,
-      deletedAtMs: input.nowMs,
-    });
+    for (const { memory_id } of memoryIds) {
+      const memory = readMemory(db, memory_id);
+      if (!memory) continue;
 
-    if (existing) {
-      // Capture local paths before the DB rows clear them, so the caller can unlink.
-      attachmentLocalPaths.push(...listAttachmentLocalPaths(db, input.messageId));
-
-      tombstoned = deleteMessage(db, input.messageId, {
-        retainDeletedContent,
-        nowMs: input.nowMs,
-      }) > 0;
-      attachmentsMarkedDeleted = markAttachmentsDeleted(db, input.messageId, input.nowMs);
-
-      const lookup = channelLookup(db);
-      const memoryIds = prepareCached(
+      // Remove the evidence link(s) to the forgotten message.
+      prepareCached(
         db,
-        'forget.dependent_memories',
-        'SELECT DISTINCT memory_id FROM memory_evidence WHERE message_id = ?',
-      ).all(input.messageId) as Array<{ memory_id: string }>;
+        'forget.delete_evidence',
+        'DELETE FROM memory_evidence WHERE memory_id = ? AND message_id = ?',
+      ).run(memory_id, input.messageId);
 
-      // Purge source-linked proactive-attention evidence for the forgotten
-      // message. Revisions left without trigger evidence are invalidated and
-      // their claims stand, so the evidence cannot return as fresh.
-      purgeAttentionForMessage(db, input.messageId, input.nowMs);
+      const prevType = memory.scope_type as ScopeType;
+      const evidence: ScopeEvidenceChannel[] = remainingEvidence(db, memory_id).map((r) => ({
+        channelId: r.channel_id,
+        isThread: r.is_thread === 1,
+      }));
 
-      for (const { memory_id } of memoryIds) {
-        const memory = readMemory(db, memory_id);
-        if (!memory) continue;
+      let action: ForgetMemoryDisposition['action'];
+      let newType: ScopeType;
 
-        // Remove the evidence link(s) to the forgotten message.
-        prepareCached(
-          db,
-          'forget.delete_evidence',
-          'DELETE FROM memory_evidence WHERE memory_id = ? AND message_id = ?',
-        ).run(memory_id, input.messageId);
-
-        const prevType = memory.scope_type as ScopeType;
-        const evidence: ScopeEvidenceChannel[] = remainingEvidence(db, memory_id).map((r) => ({
-          channelId: r.channel_id,
-          isThread: r.is_thread === 1,
-        }));
-
-        let action: ForgetMemoryDisposition['action'];
-        let newType: ScopeType;
-
-        if (evidence.length === 0) {
-          // No remaining support: invalidate if still active, else just note removal.
-          if (memory.status === 'active') {
-            invalidateMemoryRow(db, memory_id, input.nowMs);
-            action = 'invalidated';
+      if (evidence.length === 0) {
+        // No remaining support: invalidate if still active, else just note removal.
+        if (memory.status === 'active') {
+          invalidateMemoryRow(db, memory_id, input.nowMs);
+          action = 'invalidated';
+        } else {
+          action = 'evidence_removed';
+        }
+        newType = 'review_only';
+      } else {
+        const newScope = computeEffectiveScope(evidence, lookup);
+        const previousScope: EffectiveScope = {
+          scopeType: prevType,
+          scopeKey: memory.scope_key,
+        };
+        const safeScope = narrowestMemoryScope(previousScope, newScope);
+        const wouldWiden =
+          safeScope.scopeType !== newScope.scopeType || safeScope.scopeKey !== newScope.scopeKey;
+        if (
+          newScope.scopeType === 'review_only' ||
+          wouldWiden
+        ) {
+          // Uncertain / would-broaden: route to secure review, never promote.
+          if (prevType !== 'review_only') {
+            setMemoryScope(db, memory_id, { scopeType: 'review_only', scopeKey: null }, input.nowMs);
+            action = 'routed_to_review';
           } else {
             action = 'evidence_removed';
           }
           newType = 'review_only';
+        } else if (newScope.scopeType !== prevType || newScope.scopeKey !== memory.scope_key) {
+          setMemoryScope(db, memory_id, newScope, input.nowMs);
+          action = 'rescoped';
+          newType = newScope.scopeType;
         } else {
-          const newScope = computeEffectiveScope(evidence, lookup);
-          const previousScope: EffectiveScope = {
-            scopeType: prevType,
-            scopeKey: memory.scope_key,
-          };
-          const safeScope = narrowestMemoryScope(previousScope, newScope);
-          const wouldWiden =
-            safeScope.scopeType !== newScope.scopeType || safeScope.scopeKey !== newScope.scopeKey;
-          if (
-            newScope.scopeType === 'review_only' ||
-            wouldWiden
-          ) {
-            // Uncertain / would-broaden: route to secure review, never promote.
-            if (prevType !== 'review_only') {
-              setMemoryScope(db, memory_id, { scopeType: 'review_only', scopeKey: null }, input.nowMs);
-              action = 'routed_to_review';
-            } else {
-              action = 'evidence_removed';
-            }
-            newType = 'review_only';
-          } else if (newScope.scopeType !== prevType || newScope.scopeKey !== memory.scope_key) {
-            setMemoryScope(db, memory_id, newScope, input.nowMs);
-            action = 'rescoped';
-            newType = newScope.scopeType;
-          } else {
-            action = 'evidence_removed';
-            newType = newScope.scopeType;
-          }
+          action = 'evidence_removed';
+          newType = newScope.scopeType;
         }
-
-        dispositions.push({
-          memoryId: memory_id,
-          action,
-          previousScopeType: prevType,
-          newScopeType: newType,
-        });
       }
+
+      dispositions.push({
+        memoryId: memory_id,
+        action,
+        previousScopeType: prevType,
+        newScopeType: newType,
+      });
     }
+  }
 
-    const adminEventId = recordAdminEvent(db, {
-      guildId: input.guildId,
-      actorUserId: input.actorUserId,
-      action: 'forget_message',
-      target: input.messageId,
-      details: {
-        found: existing !== undefined,
-        tombstoned,
-        retainDeletedContent,
-        attachmentsMarkedDeleted,
-        memories: dispositions.map((d) => ({ memoryId: d.memoryId, action: d.action })),
-      },
-      createdAtMs: input.nowMs,
-    });
-
-    return {
+  const adminEventId = recordAdminEvent(db, {
+    guildId: input.guildId,
+    actorUserId: input.actorUserId,
+    action: 'forget_message',
+    target: input.messageId,
+    details: {
       found: existing !== undefined,
-      messageId: input.messageId,
       tombstoned,
+      retainDeletedContent,
       attachmentsMarkedDeleted,
-      attachmentLocalPaths,
-      memories: dispositions,
-      adminEventId,
-    };
+      memories: dispositions.map((d) => ({ memoryId: d.memoryId, action: d.action })),
+    },
+    createdAtMs: input.nowMs,
   });
+
+  return {
+    found: existing !== undefined,
+    messageId: input.messageId,
+    tombstoned,
+    attachmentsMarkedDeleted,
+    attachmentLocalPaths,
+    memories: dispositions,
+    adminEventId,
+  };
 }

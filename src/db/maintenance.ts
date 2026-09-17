@@ -210,6 +210,8 @@ export function pruneTerminalJobs(db: DatabaseSync, options: PruneJobsOptions): 
         WHERE created_at_ms < ?
           AND status IN (${statuses})
           AND COALESCE(completed_at_ms, updated_at_ms) < ?
+          AND NOT EXISTS (SELECT 1 FROM deletion_requests d WHERE d.job_id = jobs.id
+            AND d.status IN ('scheduled', 'executing'))
         ORDER BY created_at_ms
         LIMIT ?)`,
   );

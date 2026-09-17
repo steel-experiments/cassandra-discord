@@ -68,6 +68,11 @@ function expectPinnedError(env: Record<string, string | undefined>, message: str
 }
 
 describe('config', () => {
+  it('requires explicit snowflake deletion approvers, independently of admin roles', () => {
+    expect(loadConfig({ env: baseEnv() }).deletionApproverUserIds).toEqual([]);
+    expect(loadConfig({ env: { ...baseEnv(), CASSANDRA_DELETION_APPROVER_USER_IDS: '900000000000000001' } }).deletionApproverUserIds).toEqual(['900000000000000001']);
+    expectFail({ ...baseEnv(), CASSANDRA_DELETION_APPROVER_USER_IDS: 'niko' }, 'CASSANDRA_DELETION_APPROVER_USER_IDS');
+  });
   it('loads a minimal valid configuration', () => {
     const cfg = loadConfig({ env: baseEnv() });
     expect(cfg.discord.guildId).toBe('234567890123456789');

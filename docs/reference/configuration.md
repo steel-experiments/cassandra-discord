@@ -111,6 +111,7 @@ contain secrets.
 | `CASSANDRA_MODE` | `observe` | `observe`, `review`, or `autonomous`. |
 | `CASSANDRA_REVIEW_CHANNEL_ID` | unset | Required in review and autonomous modes. Must match the review channel in the active channel policy. |
 | `CASSANDRA_ADMIN_ROLE_IDS` | empty | Comma-separated Discord role IDs. An empty list authorizes nobody. |
+| `CASSANDRA_DELETION_APPROVER_USER_IDS` | empty | Comma-separated Discord **user** IDs allowed to approve another admin’s deletion request. Approvers also need an admin role. Empty disables new deletion requests and approvals; removal revokes uncompleted purges at their next batch. Restart to apply changes. |
 | `HTTP_ADMIN_TOKEN` | unset | Enables bearer-protected `GET /status`. Secret. |
 | `DIRECT_ANSWER_ENABLED` | `true` | Allows replies when Cassandra is explicitly mentioned. |
 

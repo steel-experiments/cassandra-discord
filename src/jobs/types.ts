@@ -18,6 +18,7 @@ export type JobType =
   | 'direct_answer'
   | 'deep_recap'
   | 'forget_user'
+  | 'execute_deletion'
   | 'review_episode'
   | 'review_due_memories'
   | 'review_due_memory_cohort'
@@ -46,6 +47,7 @@ export interface JobTypePayloadMap {
   direct_answer: { messageId: string; channelId: string };
   deep_recap: { recapId: string };
   forget_user: { userId: string };
+  execute_deletion: { requestId: string };
   review_episode: { episodeId: string };
   review_due_memories: { sinceMs?: number };
   review_due_memory_cohort: {
@@ -81,6 +83,7 @@ const REQUIRED_STRING_FIELDS: Partial<Record<JobType, string[]>> = {
   direct_answer: ['messageId', 'channelId'],
   deep_recap: ['recapId'],
   forget_user: ['userId'],
+  execute_deletion: ['requestId'],
   review_episode: ['episodeId'],
   send_outbox: ['outboxId'],
   sync_proposal_review: ['proposalId'],

@@ -107,11 +107,45 @@ up to three current evidence links rather than a synthetic intervention score.
 | --- | --- |
 | `/cassandra memory-search query:<text>` | Runs a literal full-text memory search visible from the invocation context. Use `query:*` (surrounding whitespace is ignored) for the bounded inventory compatibility form. The exact secure review channel has broader review access. |
 | `/cassandra memory-get id:<memory-id>` | Returns one complete permitted memory with host-built Discord source links. Use the full ID returned by `memory-search`. |
-| `/cassandra forget-message id:<message-id>` | Immediately purges normalized content and attachment references, removes evidence links, and re-scopes or invalidates affected memories. |
-| `/cassandra forget-user id:<user-id>` | Queues bounded, restart-safe deletion of the user's message content and evidence links. |
+| `/cassandra forget-message id:<message-id>` | Creates a deletion request for one currently stored message; shows its ID and count. Deletes nothing yet. |
+| `/cassandra forget-user user:<user>` | Select a Discord user to request deletion of their currently stored messages. Free-text names are not accepted. Deletes nothing yet. |
+| `/cassandra deletion status [id:<request-id>]` | Shows the latest four requests, or one exact request, with target, requester, approver, count, status, deadline, and worker failure when present. |
+| `/cassandra deletion approve id:<request-id> [confirmation:DELETE]` | An independently authorized approver reviews the preview, then confirms. Schedules the purge no earlier than 24 hours later. |
+| `/cassandra deletion cancel id:<request-id>` | The requester or an authorized deletion approver cancels before the first purge batch starts. |
+| `/cassandra deletion retry id:<request-id>` | The original approver retries a failed worker job using the same approved message set and original deadline. Its job record is retained while the request needs recovery. |
 
-These commands do not echo message content in their replies. Deletion actions
-are audited.
+Deletion commands work only in the configured secure review channel, whose policy
+must accept `org`, `restricted`, and `review_only` scopes. Replies are ephemeral and
+contain IDs and counts, never source message text. Attempts and state transitions
+are audited. The owner discovers pending requests with `deletion status`; requests
+do not automatically send a review card or DM.
+
+An admin role permits requests, not approval. Approval additionally requires the
+caller's user ID in `CASSANDRA_DELETION_APPROVER_USER_IDS`. The requester can never
+approve their own request, even if they are an approver or the target. With one
+configured owner, another admin must initiate a request for that owner to approve.
+No approver configured means deletion is disabled.
+
+The message set is fixed when the request is created. New messages and later
+backfilled history require another request. Approval starts a fixed 24-hour grace
+period. Content remains stored and usable until the purge starts. Cancellation
+works during that period and afterward if the worker has not started; it never
+restores a purge already in progress. `/cassandra pause` and observe mode do not
+cancel or suspend an approved deletion.
+
+At execution, the worker rechecks approval, the current approver allowlist, the
+deadline, and job ownership. It purges normalized content, removes evidence links,
+and invalidates or narrows dependent memories in restart-safe batches. Attachment
+file removal uses durable cleanup jobs. `completed` means the message batches are
+complete; attachment file cleanup may still be queued. Discord originals are not
+deleted. No undo archive is kept; message tombstones prevent automatic reimport.
+
+Removing an approver from configuration stops remaining batches after restart;
+already purged messages stay deleted. Such a request is shown as cancelled with
+its processed count, which may be nonzero. Before upgrading, verify a completed
+backup: migration 040 cancels all active legacy `forget_user` jobs because they
+have no independent approval. It does not restore previously deleted content.
+An older image without migration 040 cannot start against the upgraded database.
 
 ## MCP token management
 
