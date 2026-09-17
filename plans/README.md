@@ -8,7 +8,7 @@ honor its STOP conditions, and update the row when done.
 
 | Plan | Title | Priority | Effort | Depends on | Status |
 |---|---|---|---|---|---|
-| 001 | Render episode intervention citations inline with descriptive labels | P1 | M | — | TODO |
+| 001 | Render episode intervention citations inline with descriptive labels | P1 | M | — | DONE |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJECTED (with one-line rationale — finding fixed independently or approach abandoned)
 

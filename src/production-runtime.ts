@@ -87,7 +87,7 @@ import {
   setProposalStatus,
   type ProposalRow,
 } from './db/repositories/proposals.js';
-import { sanitizeOutboundMessage, sourceLinkUrl, stripScheduledFooter } from './discord/message-safety.js';
+import { renderInlineCitations, sanitizeOutboundMessage, sourceLinkUrl, stripScheduledFooter, type MessageLink } from './discord/message-safety.js';
 import {
   evaluateForcedReview,
   evaluateProvenanceGate,
@@ -840,6 +840,59 @@ function computeEpisodeAttentionAdmission(
   };
 }
 
+/** Discord hard cap for one plain message; an assembled intervention must fit it. */
+const EPISODE_INTERVENTION_MAX_CHARS = 2000;
+
+/** The prompt contract allows one to three inline citation markers; more reject. */
+const MAX_EPISODE_CITATION_MARKERS = 3;
+
+export type EpisodeInterventionAssembly =
+  | { outcome: 'allow'; content: string }
+  | { outcome: 'reject'; reasons: string[] };
+
+/**
+ * Assemble the deliverable episode intervention from sanitized content and its
+ * host-built links (Section 24.5). Inline `[[cite:<id>]]` markers become masked
+ * links; validated links no marker consumed become one trailing `Sources:`
+ * line, which keeps markerless legacy proposals deliverable. Pure; rejects on
+ * an invalid marker or when the assembled text cannot fit one Discord message.
+ */
+export function assembleEpisodeIntervention(
+  content: string,
+  links: readonly MessageLink[],
+): EpisodeInterventionAssembly {
+  const inline = renderInlineCitations(content, links);
+  if (inline.outcome === 'reject') return { outcome: 'reject', reasons: inline.reasons };
+  if (inline.markerCount > MAX_EPISODE_CITATION_MARKERS) {
+    return {
+      outcome: 'reject',
+      reasons: ['message uses more than three inline citation markers'],
+    };
+  }
+  const parts = [inline.content];
+  if (inline.unusedLinks.length > 0) {
+    parts.push(`Sources: ${inline.unusedLinks.map((link) => link.masked).join(' · ')}`);
+  }
+  const assembled = parts.join('\n\n');
+  if (assembled.length > EPISODE_INTERVENTION_MAX_CHARS) {
+    return {
+      outcome: 'reject',
+      reasons: ['intervention leaves insufficient room for validated source links'],
+    };
+  }
+  return { outcome: 'allow', content: assembled };
+}
+
+/**
+ * The review card quotes the exact assembled intervention — inline links and
+ * the compact `Sources:` line included — so approval queues precisely what the
+ * reviewer read (Section 25). Sources stay empty because every validated link
+ * already sits inline in the quoted text.
+ */
+export function episodeReviewPresentation(assembled: string): { proposedMessage: string; sources: [] } {
+  return { proposedMessage: assembled, sources: [] };
+}
+
 export async function routeEpisodeIntervention(
   ctx: BootstrapContext,
   client: NonNullable<DiscordWiring['client']>,
@@ -874,7 +927,25 @@ export async function routeEpisodeIntervention(
   const sanitized = sanitizeOutboundMessage({ content: message, sourceLinkMessageIds: evidenceIds,
     guildId: ctx.config.discord.guildId }, {
     resolveChannelId: (id) => resolveCurrentEvidenceMessage(id)?.stored.channel_id,
+    resolveLabel: (id) => {
+      const current = resolveCurrentEvidenceMessage(id);
+      if (!current) return undefined;
+      const channel = getChannel(ctx.db, current.stored.channel_id);
+      const channelLabel = channel?.name ? `#${channel.name}` : 'Discord';
+      return `${channelLabel} · ${new Date(current.stored.created_at_ms).toISOString().slice(0, 10)}`;
+    },
   });
+  // Citations render only after the sanitizer allowed the raw content; an
+  // unknown or malformed marker, or an assembled overflow, is an
+  // outbound-safety rejection exactly like a sanitizer rejection.
+  const assembly = sanitized.outcome === 'allow'
+    ? assembleEpisodeIntervention(sanitized.content, sanitized.sourceLinks)
+    : null;
+  const outboundSafety = sanitized.outcome === 'reject'
+    ? { outcome: 'reject' as const, reasons: sanitized.reasons }
+    : assembly !== null && assembly.outcome === 'reject'
+      ? { outcome: 'reject' as const, reasons: assembly.reasons }
+      : { outcome: 'allow' as const, reasons: [] as string[] };
   const currentResolution = resolveCurrentReviewProvenance(
     ctx.db,
     input.result.provenance,
@@ -928,20 +999,18 @@ export async function routeEpisodeIntervention(
       evidenceStrength: ctx.config.intervention.minEvidenceStrength, maxContentLength: ctx.config.intervention.maxMessageCharacters },
     eligibility: { recommend: intervention.recommend === true, dimensions: intervention.dimensions,
       confidence: intervention.confidence ?? 0, evidenceStrength: intervention.dimensions.evidenceStrength,
-      evidenceCount: evidenceIds.length, contentLength: message.length, hasDisallowedMention: sanitized.outcome === 'reject' },
+      evidenceCount: evidenceIds.length, contentLength: message.length, hasDisallowedMention: outboundSafety.outcome === 'reject' },
     provenanceGate, outboundEvidence, forcedReview, cooldown: rate.cooldown, duplicate: rate.duplicate,
     attention };
   const routing = routeProposal(routingInput);
-  const policyDecision = buildEpisodePolicyDecision(
-    routingInput,
-    routing,
-    sanitized.outcome === 'reject'
-      ? { outcome: 'reject', reasons: sanitized.reasons }
-      : { outcome: 'allow', reasons: [] },
-  );
-  const assembled = sanitized.outcome === 'allow'
-    ? [sanitized.content, sanitized.sourceLinks.length ? sanitized.sourceLinks.map((l) => l.masked).join('\n') : ''].filter(Boolean).join('\n\n')
-    : null;
+  const policyDecision = buildEpisodePolicyDecision(routingInput, routing, outboundSafety);
+  // The eligibility flag that carries outbound-safety failures renders as a
+  // disallowed-mention line; the specific sanitizer/citation/overflow reasons
+  // ride along so a stored row names its real cause.
+  const storedReasons = outboundSafety.outcome === 'reject'
+    ? [...routing.reasons, ...outboundSafety.reasons]
+    : routing.reasons;
+  const assembled = assembly !== null && assembly.outcome === 'allow' ? assembly.content : null;
   // The proposal deadline is the earlier of the ordinary 72-hour window and
   // the immutable attention window end (Section 12.7).
   const ordinaryExpiry = input.now + 72 * 60 * 60 * 1000;
@@ -953,7 +1022,7 @@ export async function routeEpisodeIntervention(
   if (routing.state === 'approved' && assembled) {
     transactionImmediate(ctx.db, () => {
       proposalId = insertProposal(ctx.db, { runId: input.result.runId, episodeId: input.episode.id,
-        targetChannelId: target.channelId, status: routing.state, computedScore: routing.score, reason: routing.reasons,
+        targetChannelId: target.channelId, status: routing.state, computedScore: routing.score, reason: storedReasons,
         policyDecision,
         message: assembled, evidenceMessageIds: evidenceIds, replyToMessageId: intervention.replyToMessageId,
         expiresAtMs, now: input.now });
@@ -979,7 +1048,7 @@ export async function routeEpisodeIntervention(
   } else if (routing.state === 'pending_review') {
     transactionImmediate(ctx.db, () => {
       proposalId = insertProposal(ctx.db, { runId: input.result.runId, episodeId: input.episode.id,
-        targetChannelId: target.channelId, status: routing.state, computedScore: routing.score, reason: routing.reasons,
+        targetChannelId: target.channelId, status: routing.state, computedScore: routing.score, reason: storedReasons,
         policyDecision,
         message: assembled, evidenceMessageIds: evidenceIds, replyToMessageId: intervention.replyToMessageId,
         expiresAtMs, now: input.now });
@@ -998,7 +1067,7 @@ export async function routeEpisodeIntervention(
     });
   } else {
     proposalId = insertProposal(ctx.db, { runId: input.result.runId, episodeId: input.episode.id,
-      targetChannelId: target.channelId, status: routing.state, computedScore: routing.score, reason: routing.reasons,
+      targetChannelId: target.channelId, status: routing.state, computedScore: routing.score, reason: storedReasons,
       policyDecision,
       message: assembled, evidenceMessageIds: evidenceIds, replyToMessageId: intervention.replyToMessageId,
       expiresAtMs, now: input.now });
@@ -1006,10 +1075,11 @@ export async function routeEpisodeIntervention(
   if (routing.state === 'approved' && assembled) {
     // The proposal and outbox are already durable in one transaction.
   } else if (routing.state === 'pending_review' && !claimLost && assembled && ctx.config.reviewChannelId) {
+    const presentation = episodeReviewPresentation(assembled);
     try {
       await deliverProposalReview({ proposalId, targetLabel: targetRow?.name ? `#${targetRow.name}` : target.channelId,
-        score: routing.score, reason: routing.reasons.join('; '), proposedMessage: sanitized.outcome === 'allow' ? sanitized.content : assembled,
-        sources: sanitized.outcome === 'allow' ? sanitized.sourceLinks.map((l) => l.masked) : [], expiresAtMs },
+        score: routing.score, reason: routing.reasons.join('; '), proposedMessage: presentation.proposedMessage,
+        sources: presentation.sources, expiresAtMs },
       { db: ctx.db, reviewChannelId: ctx.config.reviewChannelId, channel: createDiscordReviewChannel(client), secret, now: input.now });
     } catch (err) {
       ctx.logger.warn({ event: 'proposal.review_delivery_failed', proposalId,

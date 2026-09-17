@@ -54,6 +54,11 @@ Perform the following:
    the host stores the proposal silently, whatever its score.
 8. If intervention is warranted, draft one concise message suitable for the target
    channel. It must stand on permitted evidence and include no unsupported accusations.
+   Place an inline citation marker `[[cite:MESSAGE_ID]]`
+   immediately after each supported claim; use one to three markers, each naming a
+   message id you also list in `intervention.evidenceMessageIds`.
+   Never place a Discord jump URL in the message text. The host validates each ID
+   and replaces valid markers with descriptive Discord links at delivery.
 9. Finish by calling `finalize_episode_review` exactly once.
 
 Do not post a message yourself.

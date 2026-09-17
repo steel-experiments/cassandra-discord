@@ -115,6 +115,14 @@ ID-to-fingerprint revalidation of every exposed row is the automatic direct-answ
 stronger freshness mechanism; a human-reviewed proposal instead relies on its persisted
 run-exposed citations, current evidence checks, and the administrator's explicit decision.
 
+Proposal cards quote the exact text that approval will send. Episode interventions
+place each validated citation inline, beside the claim it supports, as a
+descriptive `#channel · date` link built by the host. The model only writes a
+`[[cite:MESSAGE_ID]]` marker and never authors a link. An older proposal whose
+citations carry no markers keeps its evidence on one compact `Sources:` line at
+the end of the quoted message, not on one link per line. A card posted before
+this change keeps the layout it was posted with until its proposal resolves.
+
 ## Scheduled-memory reviews
 
 A scheduled-memory review asks whether an existing memory received new human

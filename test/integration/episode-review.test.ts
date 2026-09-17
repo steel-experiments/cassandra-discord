@@ -809,6 +809,238 @@ describe('episode intervention citation exposure', () => {
     },
   );
 
+  // Inline citation rendering on episode interventions (Section 24.5): the
+  // host replaces validated [[cite:<id>]] markers with descriptive links beside
+  // their claims, keeps one compact Sources line for markerless legacy
+  // proposals, and fails closed on an invalid marker or an assembled overflow.
+  const maskedEpisodeLink = (messageId: string) =>
+    `[#general · 2023-11-14](https://discord.com/channels/${GUILD}/${CHANNEL}/${messageId})`;
+
+  function seedInlineInterventionCase(suffix: string, evidenceContents: string[]) {
+    const evidenceIds = evidenceContents.map((content, index) => `m-inline-${suffix}-${index}`);
+    const episodeId = queuedEpisode(CHANNEL, evidenceContents.map((content, index) => ({
+      id: evidenceIds[index]!, content,
+    })));
+    const memoryId = seedOrgMemory(`memory-source-${suffix}`, `memory-message-${suffix}`);
+    const runId = `run-inline-${suffix}`;
+    const cachedScopes = [{
+      scopeType: 'org',
+      scopeKey: null,
+      source: 'memory_search' as const,
+    }];
+    seedEpisodeRun(runId, episodeId, evidenceIds, [memoryId], cachedScopes);
+    return {
+      evidenceIds,
+      result: runResult({
+        runId,
+        provenance: episodeRunProvenance(evidenceIds, [memoryId], cachedScopes),
+      }),
+      episode: getEpisode(env.db, episodeId)!,
+      proposal: (message: string, interventionEvidenceIds: string[]) => ({
+        ...episodeProposal(CHANNEL, 1),
+        intervention: {
+          recommend: true,
+          reason: 'A material conflict should be surfaced.',
+          dimensions: { ...dims, impact: 1, evidenceStrength: 1, interruptionCost: 0 },
+          confidence: 1,
+          urgency: 'normal' as const,
+          targetChannelId: CHANNEL,
+          evidenceMessageIds: interventionEvidenceIds,
+          message,
+          subject: { kind: 'existing_memory', memoryId },
+          trigger: {
+            kind: 'new_human_evidence',
+            evidence: [{ messageId: evidenceIds[0]!, quote: evidenceContents[0]! }],
+            relation: 'contradiction',
+            materialChange: 'The current episode contradicts the stored launch decision.',
+          },
+        },
+      }),
+    };
+  }
+
+  async function routeInlineCase(
+    seed: ReturnType<typeof seedInlineInterventionCase>,
+    message: string,
+    interventionEvidenceIds: string[],
+    context: BootstrapContext = interventionRuntimeContext(),
+    client: unknown = {},
+  ): Promise<string | undefined> {
+    return routeEpisodeIntervention(context, client as never, 'test-secret', {
+      proposal: seed.proposal(message, interventionEvidenceIds),
+      result: seed.result,
+      episode: seed.episode,
+      scope: { grant: ORG_GRANT, target: { label: '#general', visibility: 'restricted' } },
+      now: NOW,
+      memoryOutcome: { applied: [], rejected: [], total: 0 },
+      episodeMessageIds: new Set(seed.evidenceIds),
+    });
+  }
+
+  function storedDecision(proposalId: string | undefined) {
+    const stored = getProposal(env.db, proposalId!);
+    expect(stored).toBeDefined();
+    const decision = (stored!.policyDecision ?? {}) as {
+      outboundSafety?: { outcome: string; reasons: string[] };
+    };
+    return { stored: stored!, decision };
+  }
+
+  it('renders two validated episode citations inline beside their claims', async () => {
+    const seed = seedInlineInterventionCase('inline', [
+      'We changed the launch owner.',
+      'The stored owner record is stale.',
+    ]);
+    const proposalId = await routeInlineCase(
+      seed,
+      `The launch owner changed [[cite:${seed.evidenceIds[0]}]], so the stored record is stale [[cite:${seed.evidenceIds[1]}]].`,
+      seed.evidenceIds,
+    );
+
+    const { stored } = storedDecision(proposalId);
+    expect(stored.status).toBe('pending_review');
+    expect(stored.message).toBe(
+      `The launch owner changed ${maskedEpisodeLink(seed.evidenceIds[0])}, `
+      + `so the stored record is stale ${maskedEpisodeLink(seed.evidenceIds[1])}.`,
+    );
+    expect(stored.message).not.toContain('[[cite:');
+    expect(stored.message).not.toContain('[source]');
+    expect(outboxCount()).toBe(0);
+  });
+
+  it('keeps a markerless episode intervention on one compact Sources line', async () => {
+    const seed = seedInlineInterventionCase('fallback', [
+      'We changed the launch owner.',
+      'The stored owner record is stale.',
+    ]);
+    const message = 'The launch owner changed, so the stored record is stale.';
+    const proposalId = await routeInlineCase(seed, message, seed.evidenceIds);
+
+    const { stored } = storedDecision(proposalId);
+    expect(stored.status).toBe('pending_review');
+    expect(stored.message).toBe(
+      `${message}\n\nSources: ${maskedEpisodeLink(seed.evidenceIds[0])} · ${maskedEpisodeLink(seed.evidenceIds[1])}`,
+    );
+    expect(outboxCount()).toBe(0);
+  });
+
+  async function expectMarkerRejection(message: string, expectedReason: string) {
+    const seed = seedInlineInterventionCase('marker', ['We changed the launch owner.']);
+    const proposalId = await routeInlineCase(seed, message, seed.evidenceIds);
+
+    const { stored, decision } = storedDecision(proposalId);
+    expect(stored.status).toBe('observed');
+    expect(getOutboxByDedupeKey(env.db, `proposal:${stored.id}`)).toBeUndefined();
+    expect(outboxCount()).toBe(0);
+    expect(decision.outboundSafety?.outcome).toBe('reject');
+    expect(decision.outboundSafety?.reasons.join('\n')).toContain(expectedReason);
+    expect(stored.reason).toContain(expectedReason);
+  }
+
+  it('fails closed when a message uses more than three inline citation markers', async () => {
+    const seed = seedInlineInterventionCase('marker-cap', [
+      'We changed the launch owner.',
+      'The stored owner record is stale.',
+    ]);
+    const proposalId = await routeInlineCase(
+      seed,
+      `One [[cite:${seed.evidenceIds[0]}]] two [[cite:${seed.evidenceIds[1]}]] `
+      + `three [[cite:${seed.evidenceIds[0]}]] four [[cite:${seed.evidenceIds[1]}]].`,
+      seed.evidenceIds,
+    );
+
+    const { stored, decision } = storedDecision(proposalId);
+    expect(stored.status).toBe('observed');
+    expect(outboxCount()).toBe(0);
+    expect(decision.outboundSafety?.reasons.join('\n'))
+      .toContain('more than three inline citation markers');
+    expect(stored.reason).toContain('more than three inline citation markers');
+  });
+
+  it('fails closed when an inline citation marker is unknown', async () => {
+    await expectMarkerRejection(
+      'The stored record is stale [[cite:m-inline-unknown-marker]].',
+      'is not a validated cited source',
+    );
+  });
+
+  it('fails closed when an inline citation marker is malformed', async () => {
+    await expectMarkerRejection(
+      'The stored record is stale [[cite:broken-marker.',
+      'malformed inline citation marker',
+    );
+  });
+
+  it('fails closed when inserted source links push the assembled intervention past one Discord message', async () => {
+    const seed = seedInlineInterventionCase('overflow', [
+      'We changed the launch owner.',
+      'The stored owner record is stale.',
+      'The launch checklist was replaced.',
+    ]);
+    const proposalId = await routeInlineCase(seed, 'A'.repeat(1_800), seed.evidenceIds);
+
+    const { stored, decision } = storedDecision(proposalId);
+    expect(stored.status).toBe('observed');
+    expect(stored.message).toBeNull();
+    expect(outboxCount()).toBe(0);
+    expect(decision.outboundSafety?.reasons.join('\n'))
+      .toContain('insufficient room for validated source links');
+  });
+
+  it('quotes the exact assembled deliverable on the pending-review card', async () => {
+    const seed = seedInlineInterventionCase('card', [
+      'We changed the launch owner.',
+      'The stored owner record is stale.',
+    ]);
+    const message = 'The launch owner changed, so the stored record is stale.';
+    const assembled = `${message}\n\nSources: ${maskedEpisodeLink(seed.evidenceIds[0])} · ${maskedEpisodeLink(seed.evidenceIds[1])}`;
+    const sent: string[] = [];
+    const stubClient = {
+      channels: {
+        fetch: async () => ({
+          isSendable: () => true,
+          send: async (payload: { embeds: Array<{ toJSON: () => { description?: string } }> }) => {
+            sent.push(payload.embeds[0]!.toJSON().description ?? '');
+            return { id: 'review-message-card' };
+          },
+        }),
+      },
+    };
+    const context = interventionRuntimeContext();
+    context.config.reviewChannelId = '100000000000000099';
+    const proposalId = await routeInlineCase(seed, message, seed.evidenceIds, context, stubClient);
+
+    const { stored } = storedDecision(proposalId);
+    expect(stored.status).toBe('pending_review');
+    expect(stored.message).toBe(assembled);
+    // The card quotes the exact assembled text — the compact Sources line sits
+    // inside the quoted message, and no separate per-link block follows it.
+    expect(sent).toHaveLength(1);
+    const quoted = assembled.split('\n').map((line) => (line.length === 0 ? '>' : `> ${line}`)).join('\n');
+    expect(sent[0]).toContain(quoted);
+    expect(sent[0]).not.toMatch(/\nSources:\n- \[/);
+  });
+
+  it('autonomously enqueues the exact assembled text stored on the proposal', async () => {
+    const seed = seedInlineInterventionCase('auto', ['We changed the launch owner.']);
+    const context = interventionRuntimeContext();
+    context.config.mode = 'autonomous';
+    const proposalId = await routeInlineCase(
+      seed,
+      `The launch owner changed [[cite:${seed.evidenceIds[0]}]].`,
+      seed.evidenceIds,
+      context,
+    );
+
+    const { stored } = storedDecision(proposalId);
+    const expected = `The launch owner changed ${maskedEpisodeLink(seed.evidenceIds[0])}.`;
+    expect(stored.status).toBe('approved');
+    expect(stored.message).toBe(expected);
+    const outbox = getOutboxByDedupeKey(env.db, `proposal:${stored.id}`);
+    expect(outbox?.content).toBe(expected);
+    expect(outboxCount()).toBe(1);
+  });
+
   it.each([
     ['restricted', 'visibility'] as const,
     ['review_only', 'visibility'] as const,

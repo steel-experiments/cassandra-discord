@@ -2088,6 +2088,11 @@ Perform the following:
    the host stores the proposal silently, whatever its score.
 8. If intervention is warranted, draft one concise message suitable for the target
    channel. It must stand on permitted evidence and include no unsupported accusations.
+   Place an inline citation marker `[[cite:MESSAGE_ID]]`
+   immediately after each supported claim; use one to three markers, each naming a
+   message id you also list in `intervention.evidenceMessageIds`.
+   Never place a Discord jump URL in the message text. The host validates each ID
+   and replaces valid markers with descriptive Discord links at delivery.
 9. Finish by calling `finalize_episode_review` exactly once.
 
 Do not post a message yourself.
@@ -3150,11 +3155,18 @@ Explicit direct questions do not count as autonomous interventions, but rate lim
 
 - send as a reply when a clear anchor exists;
 - disable all automatic mentions with `allowed_mentions.parse = []`;
-- use at most three masked source links, placed inline beside supported direct-answer
-  and scheduled-notification claims when the model supplies validated citation markers;
+- use at most three masked source links, placed inline beside supported direct-answer,
+  scheduled-notification, and episode-intervention claims when the model supplies
+  validated citation markers;
+- episode-intervention links the model did not mark inline stay on one compact
+  trailing `Sources:` line for compatibility with markerless legacy proposals;
 - no embed is required for normal channel interventions;
 - review-channel proposals may use an embed and buttons;
-- split is avoided by a hard 1,800-character model limit.
+- split is avoided by a hard 1,800-character model limit; episode interventions
+  additionally fail closed when the assembled text, links included, exceeds one
+  2,000-character Discord message, and an unknown or malformed citation marker —
+  or more than three of them — rejects the whole proposal before any card or
+  delivery.
 
 ---
 
@@ -3169,14 +3181,17 @@ Score: 0.84
 Reason: Current plan appears to supersede an active onboarding decision.
 
 Proposed message:
-“...”
-
-Sources:
-- context link
-- context link
+“...the earlier decision was reversed [#product · 2026-09-17](link)...”
 
 [Approve] [Dismiss]
 ```
+
+The card quotes the exact assembled outbound text — inline links and the compact
+`Sources:` line included — so approval queues precisely what the reviewer read.
+A markerless legacy proposal shows its validated citations as one compact
+`Sources: <link> · <link>` line inside that quoted text; no card the host builds
+lists links as separate per-link lines. A proposal assembled before this format
+and still pending keeps its stored per-line layout until it resolves.
 
 Approval behavior:
 
