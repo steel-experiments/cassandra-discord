@@ -237,19 +237,22 @@ export async function runFixtureMode(options: FixtureModeOptions = {}): Promise<
 
     seedFixture(db, now);
 
-    // Replay a synthetic org conversation and a restricted canary.
-    ingestMessage(db, 'm1', ORG_CHANNEL, 'we decided to adopt the onboarding trial', now);
-    ingestMessage(db, 'm2', ORG_CHANNEL, 'agreed, ship it on friday', now + 1);
-    ingestMessage(db, 'mr', RESTRICTED_CHANNEL, `the ${CANARY} merger is confidential`, now + 2);
+    // Replay a synthetic org conversation and a restricted canary. The
+    // conversation ends well before the review so it is settled under the
+    // Section 11.8 gate, exactly as a real review sees it.
+    const spokeAt = now - 30 * 60_000;
+    ingestMessage(db, 'm1', ORG_CHANNEL, 'we decided to adopt the onboarding trial', spokeAt);
+    ingestMessage(db, 'm2', ORG_CHANNEL, 'agreed, ship it on friday', spokeAt + 1);
+    ingestMessage(db, 'mr', RESTRICTED_CHANNEL, `the ${CANARY} merger is confidential`, spokeAt + 2);
 
     const { episode } = openEpisode(db, {
       guildId: GUILD,
       conversationChannelId: ORG_CHANNEL,
-      now,
+      now: spokeAt,
     });
-    extendEpisode(db, episode.id, 'm1', true, now);
-    extendEpisode(db, episode.id, 'm2', true, now + 1);
-    const episodeId = closeEpisode(db, ORG_CHANNEL, now + 2);
+    extendEpisode(db, episode.id, 'm1', true, spokeAt);
+    extendEpisode(db, episode.id, 'm2', true, spokeAt + 1);
+    const episodeId = closeEpisode(db, ORG_CHANNEL, spokeAt + 2);
     if (!episodeId) throw new Error('fixture-mode: closeEpisode produced no episode');
 
     // Full review path, offline: pre-filter → transcript → prompt → real agent

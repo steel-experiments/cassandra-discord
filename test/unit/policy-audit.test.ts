@@ -11,6 +11,7 @@ describe('policy decision audit', () => {
       forcedReview: { forceReview: false, rules: [] }, cooldown: { allowed: true, blocks: [] },
       duplicate: { matched: true, similarity: .9, messagePreview: 'SECRET_PREVIEW' },
       attention: { required: true, eligible: false, reason: 'revision_consumed', revisionId: 'rev-quiet', windowFromMs: 1, windowUntilMs: 2 },
+      liveness: { settled: false, idleMs: 45_000 },
       message: 'SECRET_MESSAGE', toolData: 'SECRET_TOOL',
     } as unknown as ProposalRoutingInput;
     const result = buildEpisodePolicyDecision(input, { state: 'observed', score: .748, reasons: ['disallowed mention'] } as ProposalRoutingResult, { outcome: 'reject', reasons: ['user mention'] });

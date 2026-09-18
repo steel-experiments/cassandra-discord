@@ -91,6 +91,7 @@ function attentionContext(): BootstrapContext {
       mode: 'review',
       reviewChannelId: REVIEW_CHANNEL,
       organization: { timezone: 'UTC' },
+      episodes: { settleSeconds: 600, settleMaxMinutes: 60 },
       memory: { scheduledReviewReminderDays: 7 },
       intervention: {
         threshold: 0.6, minConfidence: 0.6, minEvidenceStrength: 0.6,
@@ -107,15 +108,19 @@ const dims = {
   urgency: 0.9, novelty: 0.9, interruptionCost: 0,
 };
 
+// Fixture conversations end half an hour before the review, so the Section 11.8
+// settle gate sees a settled conversation and attention is what is under test.
+const SETTLED_AT = NOW - 30 * 60_000;
+
 function episodeWithMessages(messages: Array<{ id: string; content: string }>): EpisodeRow {
-  const { episode } = openEpisode(env.db, { guildId: GUILD, conversationChannelId: CHANNEL, now: NOW });
-  let t = NOW;
+  const { episode } = openEpisode(env.db, { guildId: GUILD, conversationChannelId: CHANNEL, now: SETTLED_AT });
+  let t = SETTLED_AT;
   for (const message of messages) {
     addMessage(message.id, message.content, t);
     extendEpisode(env.db, episode.id, message.id, true, t);
     t += 1;
   }
-  closeEpisode(env.db, episode.id, NOW);
+  closeEpisode(env.db, episode.id, SETTLED_AT + 60_000);
   return getEpisode(env.db, episode.id)!;
 }
 
@@ -254,6 +259,43 @@ describe('episode intervention attention gating', () => {
     expect(revisions).toEqual([]);
     const claimRow = env.db.prepare('SELECT * FROM proposal_attention_claims').get() as { proposal_id: string };
     expect(claimRow.proposal_id).toBe(proposalId);
+  });
+
+  // Section 11.8: the channel can come back to life while the model run is in
+  // flight. A proposal aimed at a live conversation is stored observed, and it
+  // claims no revision, so a later settled review may still raise the subject.
+  it('stores a proposal observed when the target conversation went live during the run', async () => {
+    addMessage('m-old', 'the original rollout decision', NOW - 30 * 86_400_000);
+    const memory = makeMemory('Rollout happens in Q3.', [ev('m-old')]);
+    const episode = episodeWithMessages([{ id: 'm-trigger', content: 'we changed the rollout plan to Friday' }]);
+    // Somebody answers while the review is running.
+    addMessage('m-still-talking', 'actually we already have a fix for that', NOW - 30_000);
+    const result = runResultFor(['m-trigger'], [memory]);
+    const proposalId = await routeEpisodeIntervention(attentionContext(), {} as never, 'secret', {
+      proposal: {
+        intervention: interventionProposal({
+          subject: { kind: 'existing_memory', memoryId: memory },
+          trigger: {
+            kind: 'new_human_evidence',
+            evidence: [{ messageId: 'm-trigger', quote: 'changed the rollout plan to Friday' }],
+            relation: 'changed_decision',
+            materialChange: 'Rollout moved to Friday.',
+          },
+        }),
+      },
+      result,
+      episode,
+      scope: { grant: ORG_GRANT, target: { label: '#general', visibility: 'org' } },
+      now: NOW,
+      memoryOutcome: { applied: [], rejected: [], total: 0 },
+      episodeMessageIds: new Set(['m-trigger']),
+    });
+    const stored = getProposal(env.db, proposalId!);
+    expect(stored?.status).toBe('observed');
+    expect(stored?.reason).toContain('conversation_live');
+    // No claim was taken, so the revision stays eligible for a settled review.
+    expect(env.db.prepare('SELECT COUNT(*) AS n FROM proposal_attention_claims').get()).toMatchObject({ n: 0 });
+    expect(selectEligibleRevisions(env.db, { now: NOW, windowMs: WINDOW, limit: 10 }).length).toBe(1);
   });
 
   it('cannot propose twice from one revision', async () => {
@@ -680,7 +722,7 @@ describe('approval and outbox attention enforcement', () => {
 
   it('lets the owner approve and send inside the attention window', async () => {
     const memoryId = seededSubject();
-    addMessage('m-approval-trigger', 'we reversed the decision today', NOW - 1000);
+    addMessage('m-approval-trigger', 'we reversed the decision today', SETTLED_AT);
     const proposalId = await routedPendingProposal(
       memoryId, 'm-approval-trigger', 'we reversed the decision today',
     );
@@ -778,7 +820,7 @@ describe('approval and outbox attention enforcement', () => {
 
   it('cancels an approved send before Discord I/O when the window ended', async () => {
     const memoryId = seededSubject();
-    addMessage('m-worker-trigger', 'we reversed the decision today', NOW - 1000);
+    addMessage('m-worker-trigger', 'we reversed the decision today', SETTLED_AT);
     const proposalId = await routedPendingProposal(
       memoryId, 'm-worker-trigger', 'we reversed the decision today',
     );
@@ -809,7 +851,7 @@ describe('approval and outbox attention enforcement', () => {
 
   it('records an already-sent marker even when the attention window later ended', async () => {
     const memoryId = seededSubject();
-    addMessage('m-sent-trigger', 'we reversed the decision today', NOW - 1000);
+    addMessage('m-sent-trigger', 'we reversed the decision today', SETTLED_AT);
     const proposalId = await routedPendingProposal(
       memoryId, 'm-sent-trigger', 'we reversed the decision today',
     );

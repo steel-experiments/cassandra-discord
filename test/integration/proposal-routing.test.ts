@@ -3,6 +3,7 @@ import { createTestDb, seedIdentity, type TestDb } from '../helpers/db.js';
 import {
   routeProposal,
   type AttentionRoutingInput,
+  type LivenessRoutingInput,
   type ProposalRoutingInput,
   type ProposalThresholds,
   type ProposalEligibilityInputs,
@@ -95,6 +96,9 @@ const DUPLICATE: DuplicateResult = {
   source: 'outbox',
 };
 
+const SETTLED: LivenessRoutingInput = { settled: true, idleMs: 30 * 60_000 };
+const LIVE: LivenessRoutingInput = { settled: false, idleMs: 45_000 };
+
 function routingInput(over: Partial<ProposalRoutingInput> = {}): ProposalRoutingInput {
   return {
     mode: 'autonomous',
@@ -106,6 +110,7 @@ function routingInput(over: Partial<ProposalRoutingInput> = {}): ProposalRouting
     cooldown: ALLOWED_COOLDOWN,
     duplicate: NO_DUPLICATE,
     attention: ADMITTED_ATTENTION,
+    liveness: SETTLED,
     ...over,
   };
 }
@@ -226,6 +231,28 @@ describe('routeProposal — rate controls bind autonomous delivery only', () => 
       routingInput({ mode: 'autonomous', forcedReview: FORCED_REVIEW, cooldown: BLOCKED_COOLDOWN }),
     );
     expect(out.state).toBe('pending_review');
+  });
+
+  // Section 11.8: a conversation that is still in progress does not need
+  // Cassandra, and a review card is gated exactly like a target send.
+  it('a live conversation suppresses an autonomous proposal to observed', () => {
+    const out = routeProposal(routingInput({ mode: 'autonomous', liveness: LIVE }));
+    expect(out.state).toBe('observed');
+    expect(out.reasons.some((r) => r.includes('conversation_live'))).toBe(true);
+  });
+
+  it('a live conversation suppresses a review card too', () => {
+    const out = routeProposal(routingInput({ mode: 'review', liveness: LIVE }));
+    expect(out.state).toBe('observed');
+    expect(out.reasons.some((r) => r.includes('conversation_live'))).toBe(true);
+  });
+
+  it('a live conversation suppresses a forced-review proposal', () => {
+    const out = routeProposal(
+      routingInput({ mode: 'autonomous', forcedReview: FORCED_REVIEW, liveness: LIVE }),
+    );
+    expect(out.state).toBe('observed');
+    expect(out.reasons.some((r) => r.includes('conversation_live'))).toBe(true);
   });
 });
 

@@ -21,6 +21,12 @@ import {
   evaluateEpisodePrefilter,
   type PrefilterEvaluation,
 } from '../../episodes/prefilter.js';
+import {
+  evaluateSettle,
+  lastHumanMessageAtMs,
+  DEFAULT_SETTLE_CONFIG,
+  type SettleConfig,
+} from '../../episodes/settle.js';
 import type { PromptCompiler } from '../../agent/prompts.js';
 import {
   executeAgentRun,
@@ -141,6 +147,8 @@ export interface ReviewEpisodeHandlerDeps {
   /** Bounded same-conversation look-ahead for asynchronous follow-ups. */
   memoryFollowupHorizonDays?: number;
   memoryFollowupMaxMessages?: number;
+  /** Conversation settle gate (Section 11.8; default ten minutes, one-hour bound). */
+  settle?: SettleConfig;
   /** Route the validated intervention. Omission fails closed to an observed row. */
   routeIntervention?: (input: {
     proposal: EpisodeReviewProposalShape;
@@ -199,12 +207,23 @@ export interface ReviewEpisodeMiss {
   status?: EpisodeRow['status'];
 }
 
+/** The conversation was still live, so the review was held (Section 11.8). */
+export interface ReviewEpisodeDeferred {
+  kind: 'deferred';
+  episodeId: string;
+  /** Epoch ms this review should be retried at. */
+  retryAtMs: number;
+  /** Quiet milliseconds observed when the gate ran. */
+  idleMs: number | null;
+}
+
 export type ReviewEpisodeOutcome =
   | ReviewEpisodeReviewed
   | ReviewEpisodeSkipped
   | ReviewEpisodeTestSurfaceSkipped
   | ReviewEpisodeErrored
-  | ReviewEpisodeMiss;
+  | ReviewEpisodeMiss
+  | ReviewEpisodeDeferred;
 
 /**
  * Fully rendered, side-effect-free input for one episode review.
@@ -441,6 +460,33 @@ export function createReviewEpisodeHandler(
       markSkipped(db, episodeId, now);
       deps.logger?.info({ episodeId }, 'review_episode: skipped Cassandra test surface');
       return { kind: 'skipped', episodeId, reason: 'test_surface' };
+    }
+
+    // Conversation settle gate (Section 11.8). A closed episode does not mean a
+    // finished discussion: the quiet close fires after a short pause and the
+    // caps fire mid-conversation. Hold the review while the channel is live so
+    // the review sees the later human messages (Section 11.6 look-ahead) and so
+    // nothing is proposed over people who are still talking. The hold runs
+    // before the episode is leased, so the episode stays `queued` and the job
+    // defers without consuming a retry attempt.
+    const settle = evaluateSettle({
+      lastHumanAtMs: lastHumanMessageAtMs(db, episode.conversation_channel_id, deps.cassandraId),
+      episodeClosedAtMs: episode.ended_at_ms ?? episode.last_activity_at_ms,
+      now,
+      config: deps.settle ?? DEFAULT_SETTLE_CONFIG,
+    });
+    if (!settle.proceed) {
+      deps.logger?.info(
+        { episodeId, retryAtMs: settle.retryAtMs, idleMs: settle.idleMs },
+        'review_episode: conversation still live; review held',
+      );
+      return { kind: 'deferred', episodeId, retryAtMs: settle.retryAtMs, idleMs: settle.idleMs };
+    }
+    if (settle.forced) {
+      deps.logger?.info(
+        { episodeId, idleMs: settle.idleMs },
+        'review_episode: hold bound reached; reviewing a live conversation without speaking',
+      );
     }
 
     // Lease the episode (queued → reviewing) before any model work so a
@@ -707,7 +753,14 @@ export function createReviewEpisodeHandler(
   };
 
   const handler = async (payload: { episodeId: string }, _job: JobRow): Promise<void> => {
-    await runReview(payload.episodeId);
+    const outcome = await runReview(payload.episodeId);
+    if (outcome.kind === 'deferred') {
+      const now = deps.now?.() ?? Date.now();
+      throw new DeferJobError(
+        'conversation has not settled',
+        Math.max(1, outcome.retryAtMs - now),
+      );
+    }
   };
 
   return Object.assign(handler, { runReview });

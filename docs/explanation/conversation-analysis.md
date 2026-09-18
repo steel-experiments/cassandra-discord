@@ -50,6 +50,27 @@ For example:
 
 The first three messages form one episode. Carol's message starts another.
 
+## Waiting for the conversation to end
+
+An episode boundary controls what one review reads. It does not show that the
+discussion is complete: 90 seconds of quiet is a pause, and the message and
+duration limits are reached while people are still typing.
+
+Cassandra therefore holds the review of a closed episode until the channel is
+quiet for `EPISODE_SETTLE_SECONDS` (10 minutes by default). The wait has two
+purposes. A held review reads the later human messages in the same conversation,
+so it sees the answer, correction, or fix that arrived after the boundary. And
+Cassandra does not interrupt a discussion that the team is still having.
+
+If a channel stays busy, the review starts anyway after
+`EPISODE_SETTLE_MAX_MINUTES`, so organizational memory is never blocked. Such a
+review can record memory, but it cannot propose a message. The same check runs
+again when the review finishes, because a channel can become active while the
+model is thinking. A proposal about an active conversation is recorded and not
+sent, and the subject can come back in a later review.
+
+A direct question to Cassandra is never delayed by this wait.
+
 ## Historical ordering and batches
 
 A newest-first historical campaign selects up to

@@ -656,6 +656,23 @@ export interface ProposalRoutingInput {
   duplicate: DuplicateResult;
   /** Proactive attention admission (Section 12.7). */
   attention: AttentionRoutingInput;
+  /** Conversation settle gate for the target channel (Section 11.8). */
+  liveness: LivenessRoutingInput;
+}
+
+/**
+ * Conversation settle admission threaded into routing (Section 11.8). Episode
+ * closure is a review boundary, not proof that a discussion ended, and a model
+ * run takes long enough for the channel to come back to life while it runs. A
+ * proposal aimed at a conversation that is live right now is stored `observed`
+ * in every mode: it claims no attention revision, so a later review of the
+ * settled conversation may still raise the same subject.
+ */
+export interface LivenessRoutingInput {
+  /** True when the target conversation is quiet enough to speak into. */
+  settled: boolean;
+  /** Quiet milliseconds observed, for the audit record. */
+  idleMs: number | null;
 }
 
 /**
@@ -755,6 +772,14 @@ export function routeProposal(input: ProposalRoutingInput): ProposalRoutingResul
   //     recommendation has no current reason to speak and is stored observed.
   if (input.attention.required && !input.attention.eligible) {
     reasons.push(`attention gate (${input.attention.reason ?? 'unqualified'}): no current reason to speak`);
+    return { state: 'observed', score, reasons };
+  }
+
+  // C3. Conversation settle gate (Section 11.8): never speak into a discussion
+  //     that is still in progress. Placed beside attention admission and before
+  //     the mode switch, so a review card is gated exactly like a target send.
+  if (!input.liveness.settled) {
+    reasons.push('conversation_live: the target conversation is still in progress');
     return { state: 'observed', score, reasons };
   }
 

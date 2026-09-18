@@ -56,6 +56,12 @@ const ALICE = '100000000000000003'; // seeded human user
 const BOT = '100000000000000004';
 const CASS = '999000000000000001';
 const NOW = 1_700_000_001_000;
+// Episode fixtures describe a conversation that already settled: the messages
+// land half an hour before the review runs, and the episode closes ten minutes
+// later. Reviewing a live conversation is held by the Section 11.8 settle gate,
+// which the deferral tests cover explicitly.
+const EPISODE_START = NOW - 30 * 60_000;
+const EPISODE_END = NOW - 20 * 60_000;
 
 const root = path.resolve(fileURLToPath(import.meta.url), '..', '..', '..');
 const promptDir = path.join(root, 'prompts');
@@ -203,15 +209,15 @@ function queuedEpisode(
   const { episode } = openEpisode(env.db, {
     guildId: GUILD,
     conversationChannelId: channel,
-    now: NOW,
+    now: EPISODE_START,
   });
-  let t = NOW;
+  let t = EPISODE_START;
   for (const m of messages) {
     insertMessage(m.id, channel, m.content, { author: m.author, createdAtMs: t });
     extendEpisode(env.db, episode.id, m.id, m.isHuman ?? true, t);
     t += 1;
   }
-  const id = closeEpisode(env.db, channel, NOW);
+  const id = closeEpisode(env.db, channel, EPISODE_END);
   if (!id) throw new Error('closeEpisode returned undefined');
   return id;
 }
@@ -278,10 +284,11 @@ function interventionRuntimeContext(): BootstrapContext {
     db: env.db,
     now: () => NOW,
     config: {
-      discord: { guildId: GUILD },
+      discord: { guildId: GUILD, applicationId: CASS },
       mode: 'review',
       reviewChannelId: undefined,
       organization: { timezone: 'UTC' },
+      episodes: { settleSeconds: 600, settleMaxMinutes: 60 },
       intervention: {
         threshold: 0.6,
         minConfidence: 0.6,
@@ -322,6 +329,128 @@ function makeDeps(over: Partial<ReviewEpisodeHandlerDeps> = {}): ReviewEpisodeHa
     ...over,
   };
 }
+
+describe('conversation settle gate — Section 11.8', () => {
+  /** Queue an episode whose conversation is still in progress at `NOW`. */
+  function liveEpisode(): string {
+    const { episode } = openEpisode(env.db, {
+      guildId: GUILD,
+      conversationChannelId: CHANNEL,
+      now: NOW - 6 * 60_000,
+    });
+    insertMessage('m-live-1', CHANNEL, 'the new deploy started failing at random', {
+      createdAtMs: NOW - 6 * 60_000,
+    });
+    insertMessage('m-live-2', CHANNEL, 'switching now would be risky', {
+      createdAtMs: NOW - 90_000,
+    });
+    extendEpisode(env.db, episode.id, 'm-live-1', true, NOW - 6 * 60_000);
+    extendEpisode(env.db, episode.id, 'm-live-2', true, NOW - 90_000);
+    const id = closeEpisode(env.db, CHANNEL, NOW);
+    if (!id) throw new Error('closeEpisode returned undefined');
+    return id;
+  }
+
+  it('holds the review of a live conversation and runs it once the channel settles', async () => {
+    const episodeId = liveEpisode();
+    let calls = 0;
+    let now = NOW;
+    const handler = createReviewEpisodeHandler(makeDeps({
+      now: () => now,
+      settle: { settleSeconds: 600, settleMaxMinutes: 60 },
+      executeRun: async () => {
+        calls += 1;
+        return runResult({ runId: 'run-after-settle' });
+      },
+    }));
+
+    // 90 seconds of quiet is a pause, not the end of a discussion.
+    const held = await handler.runReview(episodeId);
+    expect(held.kind).toBe('deferred');
+    expect(calls).toBe(0);
+    expect(getEpisode(env.db, episodeId)?.status).toBe('queued');
+
+    // The team keeps talking; the hold keeps holding.
+    insertMessage('m-live-3', CHANNEL, 'here is the fix for the random failures', {
+      createdAtMs: NOW + 60_000,
+    });
+    now = NOW + 120_000;
+    expect((await handler.runReview(episodeId)).kind).toBe('deferred');
+    expect(calls).toBe(0);
+
+    // Ten quiet minutes after the last human message, the review runs.
+    now = NOW + 60_000 + 600_000;
+    const reviewed = await handler.runReview(episodeId);
+    expect(reviewed.kind).toBe('reviewed');
+    expect(calls).toBe(1);
+    expect(getEpisode(env.db, episodeId)?.status).toBe('reviewed');
+  });
+
+  it('gives the held review the later human messages the boundary could not see', async () => {
+    const episodeId = liveEpisode();
+    insertMessage('m-live-3', CHANNEL, 'here is the fix for the random failures', {
+      createdAtMs: NOW + 60_000,
+    });
+    let prompt = '';
+    const handler = createReviewEpisodeHandler(makeDeps({
+      now: () => NOW + 60_000 + 600_000,
+      settle: { settleSeconds: 600, settleMaxMinutes: 60 },
+      executeRun: async (deps) => {
+        prompt = deps.promptText;
+        return runResult({ runId: 'run-with-followups' });
+      },
+    }));
+    expect((await handler.runReview(episodeId)).kind).toBe('reviewed');
+    expect(prompt).toContain('here is the fix for the random failures');
+  });
+
+  it('defers the durable job without consuming a retry attempt', async () => {
+    const episodeId = liveEpisode();
+    let now = NOW;
+    const handler = createReviewEpisodeHandler(makeDeps({
+      now: () => now,
+      settle: { settleSeconds: 600, settleMaxMinutes: 60 },
+      executeRun: async () => runResult({ runId: 'run-after-settle' }),
+    }));
+    enqueue(env.db, { type: 'review_episode', payload: { episodeId },
+      uniqueKey: `episode:review:${episodeId}`, now });
+    const worker = new JobWorker({ db: env.db, owner: 'test', leaseMs: 60_000,
+      pollIntervalMs: 1, shutdownTimeoutMs: 100, clock: () => now });
+    worker.register('review_episode', 1, handler);
+
+    await worker.runOnce();
+    const job = env.db.prepare(
+      "SELECT status, attempts, run_after_ms FROM jobs WHERE type='review_episode'",
+    ).get() as { status: string; attempts: number; run_after_ms: number };
+    expect(job.status).toBe('queued');
+    expect(job.attempts).toBe(0);
+    // Retried at the settle deadline of the last human message, not immediately.
+    expect(job.run_after_ms).toBe(NOW - 90_000 + 600_000);
+    expect(getEpisode(env.db, episodeId)?.status).toBe('queued');
+
+    now = NOW - 90_000 + 600_000;
+    await worker.runOnce();
+    expect(getEpisode(env.db, episodeId)?.status).toBe('reviewed');
+  });
+
+  it('reviews a conversation that never settles once the hold bound is reached', async () => {
+    const episodeId = liveEpisode();
+    insertMessage('m-live-busy', CHANNEL, 'still going', { createdAtMs: NOW + 59 * 60_000 });
+    let calls = 0;
+    const handler = createReviewEpisodeHandler(makeDeps({
+      now: () => NOW + 61 * 60_000,
+      settle: { settleSeconds: 600, settleMaxMinutes: 60 },
+      executeRun: async () => {
+        calls += 1;
+        return runResult({ runId: 'run-at-bound' });
+      },
+    }));
+    // Memory extraction is never blocked by a channel that stays busy; the
+    // routing gate is what keeps a forced review from speaking.
+    expect((await handler.runReview(episodeId)).kind).toBe('reviewed');
+    expect(calls).toBe(1);
+  });
+});
 
 describe('review_episode — orchestration (stubbed executor)', () => {
   it('includes bounded delayed human follow-ups and excludes bot follow-ups', async () => {

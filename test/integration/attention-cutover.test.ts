@@ -27,7 +27,11 @@ const ORG_GRANT: RetrievalGrant = { includeOrgMessages: true, includeOrgMemories
 
 let env: TestDb;
 
-function addMessage(id: string, content: string, at = NOW): string {
+// Fixture messages predate the review by half an hour, so the Section 11.8
+// settle gate sees a conversation that already ended.
+const SETTLED_AT = NOW - 30 * 60_000;
+
+function addMessage(id: string, content: string, at = SETTLED_AT): string {
   upsertMessageCreate(env.db, {
     id, guildId: GUILD, channelId: CHANNEL, authorId: ALICE, authorDisplayName: 'Alice', content,
     createdAtMs: at, editedAtMs: null, replyToMessageId: null, messageType: 0, flags: 0,
@@ -207,6 +211,7 @@ describe('attention cutover — Section 12.7', () => {
         discord: { guildId: GUILD, applicationId: '100000000000000099' },
         mode: 'review',
         organization: { timezone: 'UTC' },
+        episodes: { settleSeconds: 600, settleMaxMinutes: 60 },
         intervention: {
           threshold: 0.6, minConfidence: 0.6, minEvidenceStrength: 0.6,
           maxMessageCharacters: 1_800, channelCooldownMinutes: 180, globalDailyLimit: 5,

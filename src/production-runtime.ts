@@ -79,6 +79,7 @@ import { PeriodicScheduler, buildSchedules, nodeTimerDriver } from './jobs/sched
 import { isPaused } from './runtime-state.js';
 import { defaultModelLookup, resolveAgentModels } from './agent/model.js';
 import { evaluateCooldowns, DEFAULT_COOLDOWN_CONFIG } from './agent/cooldowns.js';
+import { evaluateSettle, lastHumanMessageAtMs } from './episodes/settle.js';
 import { detectDuplicate } from './agent/duplicate-policy.js';
 import { reconcileOutboxSending, createDiscordRecentSentLookup } from './outbox/recovery.js';
 import { enqueueOutbox } from './outbox/repository.js';
@@ -987,6 +988,18 @@ export async function routeEpisodeIntervention(
     evidenceStrength: intervention.dimensions.evidenceStrength, distinctRestrictedChannelCount: restrictedChannels.size,
     uncertain: provenanceGate.outcome === 'force_review' || outboundEvidence.outcome === 'force_review' });
   const rate = recentChecks(ctx, target.channelId, message, input.now, 'autonomous');
+  // Conversation settle, rechecked against the target channel now that the model
+  // run has finished (Section 11.8). The run takes long enough for the channel
+  // to come back to life while it is in flight.
+  const liveness = evaluateSettle({
+    lastHumanAtMs: lastHumanMessageAtMs(ctx.db, target.channelId, ctx.config.discord.applicationId),
+    episodeClosedAtMs: input.episode.ended_at_ms ?? input.episode.last_activity_at_ms,
+    now: input.now,
+    config: {
+      settleSeconds: ctx.config.episodes.settleSeconds,
+      settleMaxMinutes: ctx.config.episodes.settleMaxMinutes,
+    },
+  });
   const attention = computeEpisodeAttentionAdmission(ctx, {
     intervention,
     memoryOutcome: input.memoryOutcome,
@@ -1002,7 +1015,7 @@ export async function routeEpisodeIntervention(
       confidence: intervention.confidence ?? 0, evidenceStrength: intervention.dimensions.evidenceStrength,
       evidenceCount: evidenceIds.length, contentLength: message.length, hasDisallowedMention: outboundSafety.outcome === 'reject' },
     provenanceGate, outboundEvidence, forcedReview, cooldown: rate.cooldown, duplicate: rate.duplicate,
-    attention };
+    attention, liveness: { settled: liveness.settled, idleMs: liveness.idleMs } };
   const routing = routeProposal(routingInput);
   const policyDecision = buildEpisodePolicyDecision(routingInput, routing, outboundSafety);
   // The eligibility flag that carries outbound-safety failures renders as a
@@ -1492,6 +1505,10 @@ export async function createProductionJobRuntime(
     memoryMinimumImportance: ctx.config.memory.minimumImportance,
     memoryFollowupHorizonDays: ctx.config.memory.followupHorizonDays,
     memoryFollowupMaxMessages: ctx.config.memory.followupMaxMessages,
+    settle: {
+      settleSeconds: ctx.config.episodes.settleSeconds,
+      settleMaxMinutes: ctx.config.episodes.settleMaxMinutes,
+    },
     attentionWindowMs: ctx.config.intervention.attentionWindowDays * 86_400_000,
     attentionTimezone: ctx.config.organization.timezone,
     routeIntervention: (input) => routeEpisodeIntervention(ctx, client, reviewSecret, input),

@@ -10,6 +10,7 @@ import {
   OAUTH_AUTHORIZATION_SERVER_PATH,
   protectedResourceMetadataPath,
 } from './mcp/oauth/metadata.js';
+import { DEFAULT_SETTLE_SECONDS, DEFAULT_SETTLE_MAX_MINUTES } from './episodes/settle.js';
 
 /**
  * Typed application configuration (Sections 14, 35).
@@ -105,6 +106,10 @@ export interface EpisodeConfig {
   quietSeconds: number;
   maxMessages: number;
   maxMinutes: number;
+  /** Quiet seconds a conversation needs before its review may run (Section 11.8). */
+  settleSeconds: number;
+  /** Upper bound on holding a review for a busy conversation (Section 11.8). */
+  settleMaxMinutes: number;
 }
 
 export interface HistoricalMemoryConfig {
@@ -891,10 +896,14 @@ export function loadConfig(options: LoadConfigOptions = {}): AppConfig {
     quietSeconds: parseInt_(env(e, 'EPISODE_QUIET_SECONDS'), 90, 'EPISODE_QUIET_SECONDS'),
     maxMessages: parseInt_(env(e, 'EPISODE_MAX_MESSAGES'), 40, 'EPISODE_MAX_MESSAGES'),
     maxMinutes: parseInt_(env(e, 'EPISODE_MAX_MINUTES'), 10, 'EPISODE_MAX_MINUTES'),
+    settleSeconds: parseInt_(env(e, 'EPISODE_SETTLE_SECONDS'), DEFAULT_SETTLE_SECONDS, 'EPISODE_SETTLE_SECONDS'),
+    settleMaxMinutes: parseInt_(env(e, 'EPISODE_SETTLE_MAX_MINUTES'), DEFAULT_SETTLE_MAX_MINUTES, 'EPISODE_SETTLE_MAX_MINUTES'),
   };
   assertPositive(episodes.quietSeconds, 'EPISODE_QUIET_SECONDS');
   assertPositive(episodes.maxMessages, 'EPISODE_MAX_MESSAGES');
   assertPositive(episodes.maxMinutes, 'EPISODE_MAX_MINUTES');
+  assertPositive(episodes.settleSeconds, 'EPISODE_SETTLE_SECONDS');
+  assertPositive(episodes.settleMaxMinutes, 'EPISODE_SETTLE_MAX_MINUTES');
 
   const historicalMemory: HistoricalMemoryConfig = {
     enabled: parseBool(env(e, 'HISTORICAL_MEMORY_ENABLED'), false),

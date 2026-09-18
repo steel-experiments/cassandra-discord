@@ -168,6 +168,8 @@ sync paths may still touch older rows.
 | `EPISODE_QUIET_SECONDS` | `90` | Close an inactive episode after this delay. |
 | `EPISODE_MAX_MESSAGES` | `40` | Close an episode at this message count. |
 | `EPISODE_MAX_MINUTES` | `10` | Maximum episode duration. |
+| `EPISODE_SETTLE_SECONDS` | `600` | Quiet seconds the conversation needs before its review runs. A closed episode whose channel is still active is held, not reviewed. |
+| `EPISODE_SETTLE_MAX_MINUTES` | `60` | Upper bound on holding one review. Past this, the review runs so memory is not blocked, but it cannot propose a message. |
 | `AGENT_MAX_CONCURRENCY` | `1` | Concurrent model jobs. |
 | `AGENT_TIMEOUT_SECONDS` | `120` | Wall-clock limit per run. |
 | `AGENT_MAX_TOOL_CALLS` | `8` | Retrieval tool-call limit per run. When it is spent, the run enters a finalize-only phase: the model is offered the terminal tool alone and asked to finalize with the evidence already retrieved. |

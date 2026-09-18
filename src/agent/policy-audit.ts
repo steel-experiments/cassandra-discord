@@ -35,6 +35,8 @@ export interface EpisodePolicyDecisionAudit {
     windowFromMs: number;
     windowUntilMs: number;
   };
+  /** Conversation settle gate (Section 11.8): quiet state of the target channel. */
+  liveness: { settled: boolean; idleMs: number };
   reasons: string[];
 }
 
@@ -83,6 +85,10 @@ export function buildEpisodePolicyDecision(
       ...(typeof input.attention.revisionId === 'string' ? { revisionId: input.attention.revisionId.slice(0, 80) } : {}),
       windowFromMs: finite(input.attention.windowFromMs),
       windowUntilMs: finite(input.attention.windowUntilMs),
+    },
+    liveness: {
+      settled: input.liveness.settled !== false,
+      idleMs: finite(input.liveness.idleMs),
     },
     reasons: strings(result.reasons),
   };

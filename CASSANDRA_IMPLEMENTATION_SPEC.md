@@ -3,7 +3,7 @@ title: Cassandra for Discord — Final Implementation Specification
 status: Final v1 specification
 version: 1.4
 date: 2026-08-21
-last_amended: 2026-09-17
+last_amended: 2026-09-18
 target_runtime: Node.js container
 target_platforms:
   - Coolify on a single VM
@@ -1245,6 +1245,10 @@ Close when the first condition is reached:
 
 An episode with only one trivial message may be stored but not reviewed.
 
+Closure is a boundary for review coherence and cost. It is not evidence that the
+discussion ended: a quiet close fires after a short pause, and the message and duration
+caps fire while the channel is busy. Review timing is therefore separate (Section 11.8).
+
 ### 11.4 Local pre-filter
 
 The local pre-filter may skip an LLM review when all are true:
@@ -1316,6 +1320,42 @@ only authoritative result.
 - The experiment is valid only while `AGENT_THINKING_LEVEL=medium`, and the candidate
   model/reasoning pair must differ from the authoritative pair. Historical episodes never
   participate.
+
+### 11.8 Conversation settle gate
+
+(Amendment (plan 018): Cassandra must not speak into a conversation that is still in
+progress. Episode closure says nothing about whether the people are still talking, so
+review timing and speech admission are gated on the conversation itself.)
+
+**Settle window.** A conversation is settled when the most recent meaningful human
+message in the episode's conversation channel is at least `EPISODE_SETTLE_SECONDS` old
+(default `600`, a positive integer). Cassandra's own messages, other bots, deleted
+messages, and empty messages never count as activity. The gate reads current message
+state, so a message deleted after it arrived stops holding the conversation open.
+
+**Deferred review.** A `review_episode` job for a live conversation is held, not run: the
+host reschedules it to the settle deadline without consuming a retry attempt and without
+leasing the episode, which stays `queued`. A held review is retried as often as the
+conversation is extended. Holding is bounded: once an episode has been queued for
+`EPISODE_SETTLE_MAX_MINUTES` (default `60`, a positive integer), the review runs on the
+next attempt, so organizational memory is never blocked by a busy channel. The bound is
+measured from episode closure and is not extended by later activity.
+
+A held review is not a lost review. The look-ahead of Section 11.6 is bounded by the
+review's own clock, so a review that runs after the conversation settles sees the later
+human messages — including answers, corrections, and fixes — that a review at the episode
+boundary cannot see. This is the intended reason to wait.
+
+**Speech admission.** Settle is rechecked at intervention routing, against the proposal's
+target channel, immediately before the proposal is stored (Section 24.2). A proposal
+whose target is live at that moment is stored `observed` with the content-free reason
+`conversation_live`, in every mode, including review and forced-review cards. This closes
+the window between the start of a model run and its result. An observed proposal claims
+no attention revision (Section 12.7), so the same subject may still be raised by a later
+review once the conversation has settled.
+
+The gate binds proactive episode speech only. An explicit direct answer is a reply to a
+question that a human just asked, and is never delayed or suppressed by settle.
 
 ---
 
@@ -3072,13 +3112,17 @@ An ordinary proactive intervention passes baseline eligibility only when:
   carries a valid subject and a recent human trigger, or a due explicit deadline
   (Section 12.7);
 - content length is within limit;
-- no disallowed mention is present.
+- no disallowed mention is present;
+- the target conversation is settled (Section 11.8).
 
 Baseline eligibility decides whether an ordinary intervention can proceed to routing; it
 does not by itself authorize delivery. Attention admission is part of baseline
 eligibility and runs before review routing, so review and forced-review cards consume
 attention exactly like autonomous sends; a recommendation without a valid subject or
-trigger is stored as `observed` with a content-free reason. In every mode, the host
+trigger is stored as `observed` with a content-free reason. The settle gate of
+Section 11.8 is applied the same way and for the same reason: a conversation that is
+still in progress does not need Cassandra, and a proposal about it is stored `observed`
+rather than carded. In every mode, the host
 separately verifies that:
 
 - every cited evidence ID was exposed during the originating run and still resolves to
@@ -5420,6 +5464,8 @@ as reconciliation overlap, may still touch older rows.
 EPISODE_QUIET_SECONDS=90
 EPISODE_MAX_MESSAGES=40
 EPISODE_MAX_MINUTES=10
+EPISODE_SETTLE_SECONDS=600
+EPISODE_SETTLE_MAX_MINUTES=60
 
 AGENT_MAX_CONCURRENCY=1
 AGENT_TIMEOUT_SECONDS=120
